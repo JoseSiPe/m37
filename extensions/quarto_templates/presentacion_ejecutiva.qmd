@@ -1,0 +1,11 @@
+---
+title: "Presentación Ejecutiva M37"
+lang: es
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+  pptx: default
+---
+
+{{< include Informe.md >}}

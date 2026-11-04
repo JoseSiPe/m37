@@ -1,0 +1,664 @@
+"""M37 (Move 37) — SPEC-03 & SPEC-05: Phase A Mechanical Verification, SDD Audit & Blind QA Allowlist."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+from m37.config import WorkspacePaths, get_core_repo_root
+from m37.guards import (
+    EXCLUDED_CODE_DIRS,
+    RECEIPT_FILENAME,
+    QuarantinedArtifactError,
+    compute_code_tree_sha256,
+    compute_inputs_hash,
+    is_artifact_quarantined,
+    resolve_artifact_by_id,
+    sha256_file,
+    write_utf8_lf,
+)
+from m37.schemas import (
+    EPISTEMIC_RANK,
+    ContractValidationError,
+    DerivationContract,
+    EvidenceContract,
+    FindingContract,
+    QAVerdictContract,
+    RigorLevel,
+    dump_markdown_note,
+    extract_wikilink_id,
+    parse_raw_artifact,
+    validate_artifact_content,
+)
+
+RF_ID_RE = re.compile(r"\bRF-\d{2,3}\b")
+PY_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
+
+
+@dataclass
+class PhaseAResult:
+    passed: bool
+    artifact_id: str
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    computed_hash_insumos: str | None = None
+
+
+def _lookup_nested_key(mapping: dict[str, Any], dotted_key: str) -> tuple[bool, Any]:
+    if dotted_key in mapping:
+        return True, mapping[dotted_key]
+    cur: Any = mapping
+    for part in dotted_key.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return False, None
+    return True, cur
+
+
+def _values_equal(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)) and not isinstance(
+        expected, bool
+    ) and not isinstance(actual, bool):
+        return abs(float(expected) - float(actual)) <= 1e-6
+    return expected == actual
+
+
+def _collect_existing_test_functions(code_dir: Path) -> tuple[set[str], set[str]]:
+    """Return (bare_test_names, qualified_relpath_test_names) discovered inside codigo/<encargo>/."""
+    bare_names: set[str] = set()
+    qualified_names: set[str] = set()
+    if not code_dir.is_dir():
+        return bare_names, qualified_names
+
+    for py_file in sorted(code_dir.rglob("*.py")):
+        rel = py_file.relative_to(code_dir)
+        if any(part in EXCLUDED_CODE_DIRS for part in rel.parts):
+            continue
+        content = py_file.read_text(encoding="utf-8", errors="replace")
+        for match in PY_TEST_DEF_RE.finditer(content):
+            fn_name = match.group(1)
+            bare_names.add(fn_name)
+            qualified_names.add(f"{rel.as_posix()}::{fn_name}")
+            qualified_names.add(f"{py_file.name}::{fn_name}")
+    return bare_names, qualified_names
+
+
+def verify_sdd_code_derivation(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    deriv: DerivationContract,
+) -> list[str]:
+    """SPEC-03 §2.2 & SPEC-05 §4.2 (#10, #11): Verify kernel receipt, live tree hash, and 100% EARS RF-* test coverage."""
+    errors: list[str] = []
+    code_dir = (paths.codigo_root / engagement_id).resolve()
+    receipt_path = code_dir / RECEIPT_FILENAME
+
+    if not code_dir.is_dir():
+        return [f"No existe el directorio de código aislado codigo/{engagement_id}/."]
+    if not receipt_path.is_file():
+        return [
+            f"Falta el recibo de verificación del microkernel ({RECEIPT_FILENAME}) en codigo/{engagement_id}/. "
+            "Ejecuta run_verification_cmd antes de registrar la Derivación."
+        ]
+
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return [f"Recibo {RECEIPT_FILENAME} corrupto: {exc}"]
+
+    if receipt.get("exit_code") != 0:
+        errors.append(
+            f"La suite de tests falló en el recibo del microkernel (exit_code={receipt.get('exit_code')!r} != 0)."
+        )
+
+    live_tree_sha256 = compute_code_tree_sha256(code_dir)
+    if receipt.get("tree_sha256") != live_tree_sha256:
+        errors.append(
+            "Desajuste de integridad en código (tree_sha256): los archivos en codigo/<encargo>/ fueron modificados "
+            f"después de ejecutar los tests (recibo={receipt.get('tree_sha256')!r} vs actual={live_tree_sha256!r})."
+        )
+
+    if deriv.productor_sha256 and deriv.productor_sha256 != live_tree_sha256:
+        errors.append(
+            f"productor_sha256 declarado en Derivación ({deriv.productor_sha256!r}) no coincide con "
+            f"tree_sha256 real ({live_tree_sha256!r})."
+        )
+
+    # Gather all required EARS RF-* IDs from metadatos_metodo and upstream input specs
+    required_rfs: set[str] = set()
+    meta_rfs = deriv.metadatos_metodo.get("requisitos_ears")
+    if isinstance(meta_rfs, list):
+        for item in meta_rfs:
+            if isinstance(item, dict) and "id" in item:
+                required_rfs.add(str(item["id"]).strip())
+            else:
+                for m in RF_ID_RE.findall(str(item)):
+                    required_rfs.add(m)
+    elif isinstance(meta_rfs, dict):
+        required_rfs.update(str(k).strip() for k in meta_rfs.keys())
+
+    for inp in deriv.insumos:
+        try:
+            inp_path = resolve_artifact_by_id(paths, engagement_id, inp.id_o_ruta)
+            if inp_path.suffix.lower() in (".md", ".json", ".yaml", ".yml", ".txt"):
+                txt = inp_path.read_text(encoding="utf-8", errors="replace")
+                required_rfs.update(RF_ID_RE.findall(txt))
+        except FileNotFoundError:
+            pass
+
+    cobertura = deriv.salidas.get("cobertura_rf")
+    if not isinstance(cobertura, dict) or not cobertura:
+        errors.append(
+            "La Derivación de verificación de código debe incluir salidas['cobertura_rf'] mapeando cada RF-* a sus tests."
+        )
+        return errors
+
+    if not required_rfs:
+        required_rfs.update(str(k).strip() for k in cobertura.keys() if RF_ID_RE.fullmatch(str(k).strip()))
+    if not required_rfs:
+        errors.append("No se encontraron requisitos EARS (RF-*) declarados ni en insumos ni en metadatos_metodo.")
+        return errors
+
+    bare_tests, qualified_tests = _collect_existing_test_functions(code_dir)
+
+    for rf_id in sorted(required_rfs):
+        mapped = cobertura.get(rf_id)
+        test_refs = [mapped] if isinstance(mapped, str) else (list(mapped) if isinstance(mapped, list) else [])
+        test_refs = [str(t).strip() for t in test_refs if str(t).strip()]
+        if not test_refs:
+            errors.append(f"Requisito EARS {rf_id} huérfano: sin tests asignados en salidas['cobertura_rf'].")
+            continue
+
+        for tref in test_refs:
+            fn_part = tref.split("::")[-1]
+            if tref not in qualified_tests and fn_part not in bare_tests:
+                errors.append(
+                    f"El test {tref!r} declarado para {rf_id} no existe como función 'def {fn_part}(...)' en codigo/{engagement_id}/."
+                )
+
+    return errors
+
+
+def _load_and_run_method_validator_plugin(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    metodo_id: str,
+    deriv: DerivationContract,
+) -> list[str]:
+    """Load optional validador_plugin declared in 40_Metodos/<metodo>.md frontmatter."""
+    bare_metodo = extract_wikilink_id(metodo_id)
+    metodo_note = paths.vault_root / "40_Metodos" / f"{bare_metodo}.md"
+    if not metodo_note.is_file():
+        return []
+    try:
+        meta, _ = parse_raw_artifact(metodo_note.read_text(encoding="utf-8"), suffix=".md")
+    except ContractValidationError:
+        return []
+
+    plugin_name = str(meta.get("validador_plugin") or "").strip()
+    if not plugin_name:
+        return []
+
+    if plugin_name == "sdd_codigo":
+        return verify_sdd_code_derivation(paths, engagement_id, deriv)
+
+    plugin_candidates = [
+        paths.workspace_root / "extensions" / "method_validators" / f"{plugin_name}.py",
+        get_core_repo_root() / "extensions" / "method_validators" / f"{plugin_name}.py",
+    ]
+    for plugin_file in plugin_candidates:
+        if plugin_file.is_file():
+            spec = importlib.util.spec_from_file_location(f"m37_validator_{plugin_name}", plugin_file)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                validate_fn = getattr(module, "validate_derivation", None)
+                if callable(validate_fn):
+                    return list(validate_fn(paths, engagement_id, deriv))
+    return [f"No se encontró el validador_plugin {plugin_name!r} requerido por 40_Metodos/{bare_metodo}.md."]
+
+
+def verify_derivation_phase_a(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    derivation_path: Path,
+    rigor: RigorLevel = "L3",
+) -> PhaseAResult:
+    """Mechanical Phase A check for a Derivation artifact (D-*.json or D-*.md)."""
+    if not derivation_path.is_file():
+        return PhaseAResult(passed=False, artifact_id=derivation_path.stem, errors=["Archivo de Derivación no existe."])
+
+    try:
+        validated, _, _ = validate_artifact_content(
+            derivation_path.read_text(encoding="utf-8"),
+            suffix=derivation_path.suffix,
+            expected_tipo="derivacion",
+        )
+    except ContractValidationError as exc:
+        return PhaseAResult(passed=False, artifact_id=derivation_path.stem, errors=[str(exc)])
+
+    assert isinstance(validated, DerivationContract)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if validated.invalidada:
+        errors.append(f"La Derivación {validated.id} está en cuarentena: {validated.motivo_invalidacion}")
+
+    for inp in validated.insumos:
+        try:
+            inp_path = resolve_artifact_by_id(paths, engagement_id, inp.id_o_ruta)
+        except FileNotFoundError as exc:
+            errors.append(str(exc))
+            continue
+
+        quarantined, q_reason = is_artifact_quarantined(inp_path)
+        if quarantined:
+            errors.append(f"Insumo {inp.id_o_ruta!r} de {validated.id} está en cuarentena: {q_reason}")
+
+        actual_sha = sha256_file(inp_path)
+        if inp.sha256 != actual_sha:
+            errors.append(
+                f"Insumo desactualizado en {validated.id}: {inp.id_o_ruta!r} cambió de hash "
+                f"(declarado={inp.sha256[:12]}... vs actual={actual_sha[:12]}...)."
+            )
+
+    if validated.productor_modo == "script":
+        script_candidates = [
+            (paths.workspace_root / validated.productor_ref).resolve(),
+            (paths.analisis_root / engagement_id / validated.productor_ref).resolve(),
+        ]
+        script_file = next((p for p in script_candidates if p.is_file()), None)
+        if script_file is None:
+            errors.append(f"Script productor no encontrado para {validated.id}: {validated.productor_ref!r}")
+        elif validated.productor_sha256 and sha256_file(script_file) != validated.productor_sha256:
+            errors.append(f"El script {validated.productor_ref!r} cambió respecto a productor_sha256.")
+
+    if validated.productor_modo == "verificacion_codigo":
+        errors.extend(verify_sdd_code_derivation(paths, engagement_id, validated))
+
+    plugin_errors = _load_and_run_method_validator_plugin(paths, engagement_id, validated.metodo, validated)
+    for err in plugin_errors:
+        if err not in errors:
+            errors.append(err)
+
+    return PhaseAResult(passed=(len(errors) == 0), artifact_id=validated.id, errors=errors, warnings=warnings)
+
+
+def verify_finding_phase_a(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    finding_path: Path,
+    rigor: RigorLevel = "L3",
+    *,
+    r1_finding_snapshot: FindingContract | dict[str, Any] | str | None = None,
+    r1_verdict: QAVerdictContract | Path | None = None,
+) -> PhaseAResult:
+    """SPEC-03 §2.2 & §2.3: Mechanical Phase A check + Ronda 2 Anti-Cosmetic Concession Gate."""
+    if not finding_path.is_file():
+        return PhaseAResult(passed=False, artifact_id=finding_path.stem, errors=["Archivo de Hallazgo no existe."])
+
+    try:
+        validated, _, _ = validate_artifact_content(
+            finding_path.read_text(encoding="utf-8"),
+            suffix=finding_path.suffix,
+            expected_tipo="hallazgo",
+        )
+    except ContractValidationError as exc:
+        return PhaseAResult(passed=False, artifact_id=finding_path.stem, errors=[str(exc)])
+
+    assert isinstance(validated, FindingContract)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if rigor in ("L3", "L4") and validated.contrahipotesis_probadas < 1:
+        errors.append(f"Rigor {rigor} exige contrahipotesis_probadas >= 1 (actual: {validated.contrahipotesis_probadas}).")
+
+    # 1. Verify upstream Evidence references
+    today = date.today()
+    for ev_ref in validated.sustento_evidencia:
+        try:
+            ev_path = resolve_artifact_by_id(paths, engagement_id, ev_ref)
+        except FileNotFoundError as exc:
+            errors.append(str(exc))
+            continue
+
+        quarantined, q_reason = is_artifact_quarantined(ev_path)
+        if quarantined:
+            errors.append(f"Evidencia {ev_ref!r} en cuarentena: {q_reason}")
+            continue
+
+        try:
+            ev_obj, _, _ = validate_artifact_content(
+                ev_path.read_text(encoding="utf-8"),
+                suffix=ev_path.suffix,
+                expected_tipo="evidencia",
+            )
+            assert isinstance(ev_obj, EvidenceContract)
+            if rigor in ("L3", "L4") and not ev_obj.cita_verificada:
+                errors.append(f"La evidencia {ev_obj.id} tiene cita_verificada=False (bloqueante en {rigor}).")
+            age_days = (today - ev_obj.fecha_verificacion).days
+            if age_days > ev_obj.vigencia_dias_max:
+                msg = f"Evidencia {ev_obj.id} vencida ({age_days} días > vigencia {ev_obj.vigencia_dias_max} días)."
+                if rigor == "L4":
+                    errors.append(msg)
+                else:
+                    warnings.append(msg)
+        except ContractValidationError as exc:
+            errors.append(f"Contrato inválido en evidencia {ev_ref!r}: {exc}")
+
+    # 2. Verify upstream Derivation references & collect outputs for valores_anclados
+    derivation_outputs: list[dict[str, Any]] = []
+    for der_ref in validated.sustento_derivaciones:
+        try:
+            der_path = resolve_artifact_by_id(paths, engagement_id, der_ref)
+        except FileNotFoundError as exc:
+            errors.append(str(exc))
+            continue
+
+        der_res = verify_derivation_phase_a(paths, engagement_id, der_path, rigor=rigor)
+        if not der_res.passed:
+            errors.extend(f"[{der_res.artifact_id}] {e}" for e in der_res.errors)
+        else:
+            der_meta, _ = parse_raw_artifact(der_path.read_text(encoding="utf-8"), suffix=der_path.suffix)
+            if isinstance(der_meta.get("salidas"), dict):
+                derivation_outputs.append(der_meta["salidas"])
+
+    # 3. Verify hash_insumos freshness
+    computed_hash: str | None = None
+    try:
+        computed_hash = compute_inputs_hash(
+            paths,
+            engagement_id,
+            validated.sustento_evidencia,
+            validated.sustento_derivaciones,
+            check_quarantine=True,
+        )
+        if validated.hash_insumos != computed_hash:
+            errors.append(
+                f"hash_insumos desactualizado en {validated.id} "
+                f"(declarado={validated.hash_insumos[:12]}... vs actual={computed_hash[:12]}...)."
+            )
+    except (FileNotFoundError, QuarantinedArtifactError, ContractValidationError) as exc:
+        if str(exc) not in errors:
+            errors.append(str(exc))
+
+    # 4. Verify valores_anclados against cited Derivations' salidas
+    if validated.valores_anclados:
+        if not derivation_outputs:
+            errors.append(
+                f"{validated.id} declara valores_anclados pero no cita ninguna Derivación válida en sustento_derivaciones."
+            )
+        else:
+            for anchor_key, anchor_val in validated.valores_anclados.items():
+                matched = False
+                for out_dict in derivation_outputs:
+                    found, real_val = _lookup_nested_key(out_dict, anchor_key)
+                    if found and _values_equal(anchor_val, real_val):
+                        matched = True
+                        break
+                if not matched:
+                    errors.append(
+                        f"Valor anclado {anchor_key}={anchor_val!r} no coincide con ninguna salida de sustento_derivaciones."
+                    )
+
+    # 5. Ronda 2 Anti-Cosmetic Concession & Epistemic Drift Gate (SPEC-03 §2.3)
+    if r1_finding_snapshot is not None:
+        if isinstance(r1_finding_snapshot, FindingContract):
+            r1_finding = r1_finding_snapshot
+        elif isinstance(r1_finding_snapshot, str):
+            r1_obj, _, _ = validate_artifact_content(r1_finding_snapshot, suffix=".md", expected_tipo="hallazgo")
+            assert isinstance(r1_obj, FindingContract)
+            r1_finding = r1_obj
+        else:
+            r1_finding = FindingContract.model_validate(r1_finding_snapshot)
+
+        rank_r1 = EPISTEMIC_RANK[r1_finding.fuerza_afirmacion]
+        rank_r2 = EPISTEMIC_RANK[validated.fuerza_afirmacion]
+        hash_changed = validated.hash_insumos != r1_finding.hash_insumos
+
+        if rank_r2 > rank_r1 and not hash_changed:
+            errors.append(
+                "Deriva epistémica ascendente prohibida en Ronda 2: fuerza_afirmacion subió de "
+                f"{r1_finding.fuerza_afirmacion!r} a {validated.fuerza_afirmacion!r} sin nuevo sustento (hash_insumos idéntico)."
+            )
+
+        verdict_obj: QAVerdictContract | None = None
+        if isinstance(r1_verdict, QAVerdictContract):
+            verdict_obj = r1_verdict
+        elif isinstance(r1_verdict, Path) and r1_verdict.is_file():
+            v_parsed, _, _ = validate_artifact_content(
+                r1_verdict.read_text(encoding="utf-8"),
+                suffix=r1_verdict.suffix,
+                expected_tipo="veredicto_qa",
+            )
+            assert isinstance(v_parsed, QAVerdictContract)
+            verdict_obj = v_parsed
+
+        if verdict_obj is not None:
+            requires_material_change = any(issue.exige_cambio_material for issue in verdict_obj.hallazgos_critica)
+            if requires_material_change and not (hash_changed or rank_r2 < rank_r1):
+                errors.append(
+                    "Concesión cosmética bloqueada en Ronda 2: el veredicto R1 marcó exige_cambio_material=True, "
+                    "pero hash_insumos permanece idéntico y fuerza_afirmacion no se degradó en EPISTEMIC_RANK."
+                )
+
+    return PhaseAResult(
+        passed=(len(errors) == 0),
+        artifact_id=validated.id,
+        errors=errors,
+        warnings=warnings,
+        computed_hash_insumos=computed_hash,
+    )
+
+
+def refresh_engagement_hashes_and_quarantine(
+    paths: WorkspacePaths,
+    engagement_id: str,
+) -> dict[str, list[str]]:
+    """Propagate upstream quarantine -> 'invalidado' and upstream hash edits -> 'desactualizado' across an engagement."""
+    enc_dir = paths.engagement_dir(engagement_id)
+    deriv_dir = enc_dir / "Derivaciones"
+    hallazgos_dir = enc_dir / "Hallazgos"
+
+    summary: dict[str, list[str]] = {
+        "derivaciones_invalidadas": [],
+        "invalidados": [],
+        "desactualizados": [],
+        "vigentes": [],
+    }
+
+    # Step 1: Cascade quarantine into Derivations if any upstream input is quarantined
+    if deriv_dir.is_dir():
+        for dpath in sorted(deriv_dir.glob("D-*")):
+            if not dpath.is_file() or dpath.suffix.lower() not in (".json", ".md"):
+                continue
+            try:
+                meta, body = parse_raw_artifact(dpath.read_text(encoding="utf-8"), suffix=dpath.suffix)
+            except ContractValidationError:
+                continue
+            if meta.get("invalidada"):
+                summary["derivaciones_invalidadas"].append(dpath.stem)
+                continue
+            for item in meta.get("insumos") or []:
+                ref = item.get("id_o_ruta", "") if isinstance(item, dict) else str(item)
+                try:
+                    up_path = resolve_artifact_by_id(paths, engagement_id, ref)
+                except FileNotFoundError:
+                    continue
+                q, q_reason = is_artifact_quarantined(up_path)
+                if q:
+                    meta["invalidada"] = True
+                    meta["motivo_invalidacion"] = f"Cascada automática por cuarentena de {ref}: {q_reason}"
+                    if dpath.suffix.lower() == ".json":
+                        write_utf8_lf(dpath, json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+                    else:
+                        write_utf8_lf(dpath, dump_markdown_note(meta, body))
+                    summary["derivaciones_invalidadas"].append(dpath.stem)
+                    break
+
+    # Step 2: Cascade quarantine ('invalidado') and hash changes ('desactualizado') into Findings
+    if hallazgos_dir.is_dir():
+        for hpath in sorted(hallazgos_dir.glob("H-*.md")):
+            try:
+                validated, meta, body = validate_artifact_content(
+                    hpath.read_text(encoding="utf-8"),
+                    suffix=".md",
+                    expected_tipo="hallazgo",
+                )
+            except ContractValidationError:
+                continue
+            assert isinstance(validated, FindingContract)
+
+            try:
+                live_hash = compute_inputs_hash(
+                    paths,
+                    engagement_id,
+                    validated.sustento_evidencia,
+                    validated.sustento_derivaciones,
+                    check_quarantine=True,
+                )
+            except QuarantinedArtifactError:
+                if meta.get("estado_qa") != "invalidado":
+                    meta["estado_qa"] = "invalidado"
+                    write_utf8_lf(hpath, dump_markdown_note(meta, body))
+                summary["invalidados"].append(validated.id)
+                continue
+            except FileNotFoundError:
+                if meta.get("estado_qa") != "desactualizado":
+                    meta["estado_qa"] = "desactualizado"
+                    write_utf8_lf(hpath, dump_markdown_note(meta, body))
+                summary["desactualizados"].append(validated.id)
+                continue
+
+            if live_hash != validated.hash_insumos:
+                if meta.get("estado_qa") != "desactualizado":
+                    meta["estado_qa"] = "desactualizado"
+                    write_utf8_lf(hpath, dump_markdown_note(meta, body))
+                summary["desactualizados"].append(validated.id)
+            else:
+                if meta.get("estado_qa") == "invalidado":
+                    summary["invalidados"].append(validated.id)
+                elif meta.get("estado_qa") == "desactualizado":
+                    summary["desactualizados"].append(validated.id)
+                else:
+                    summary["vigentes"].append(validated.id)
+
+    return summary
+
+
+def build_blind_qa_allowlist(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    artifact_path: Path,
+    *,
+    ronda: int = 1,
+    prior_verdict_path: Path | None = None,
+) -> frozenset[Path]:
+    """SPEC-03 §2.3: Construct strict file allowlist for Blind QA (zero access to Nodos/, 90_Bitacora/, 10_Clientes/)."""
+    resolved_artifact = artifact_path.resolve()
+    enc_dir = paths.engagement_dir(engagement_id).resolve()
+
+    allowed: set[Path] = {resolved_artifact}
+
+    brief_path = (enc_dir / "00_Brief.md").resolve()
+    if brief_path.is_file():
+        allowed.add(brief_path)
+
+    for agent_file in (
+        paths.vault_root / "00_Sistema" / "Agentes" / "qa-critico.md",
+        paths.vault_root / "00_Sistema" / "Agentes" / "qa-adversarial.md",
+        paths.vault_root / "00_Sistema" / "Agentes" / "validador-dominio.md",
+    ):
+        if agent_file.is_file():
+            allowed.add(agent_file.resolve())
+
+    meta, _ = parse_raw_artifact(resolved_artifact.read_text(encoding="utf-8"), suffix=resolved_artifact.suffix)
+
+    dominio = str(meta.get("dominio") or "").strip()
+    if dominio:
+        for skill_candidate in (
+            paths.vault_root / "00_Sistema" / "Skills_Dominio" / f"{dominio}.md",
+            paths.vault_root / "00_Sistema" / "Skills_Dominio" / f"{dominio}-base.md",
+        ):
+            if skill_candidate.is_file():
+                allowed.add(skill_candidate.resolve())
+
+    metodo = str(meta.get("metodo") or "").strip()
+    if metodo:
+        m_id = extract_wikilink_id(metodo)
+        m_path = (paths.vault_root / "40_Metodos" / f"{m_id}.md").resolve()
+        if m_path.is_file():
+            allowed.add(m_path)
+
+    def _add_derivation_and_inputs(d_path: Path) -> None:
+        allowed.add(d_path.resolve())
+        try:
+            d_meta, _ = parse_raw_artifact(d_path.read_text(encoding="utf-8"), suffix=d_path.suffix)
+        except ContractValidationError:
+            return
+        d_metodo = str(d_meta.get("metodo") or "").strip()
+        if d_metodo:
+            mp = (paths.vault_root / "40_Metodos" / f"{extract_wikilink_id(d_metodo)}.md").resolve()
+            if mp.is_file():
+                allowed.add(mp)
+
+        modo = d_meta.get("productor_modo")
+        if modo == "script" and d_meta.get("productor_ref"):
+            for sc in (
+                paths.workspace_root / str(d_meta["productor_ref"]),
+                paths.analisis_root / engagement_id / str(d_meta["productor_ref"]),
+            ):
+                if sc.is_file():
+                    allowed.add(sc.resolve())
+        elif modo == "verificacion_codigo":
+            code_dir = (paths.codigo_root / engagement_id).resolve()
+            if code_dir.is_dir():
+                for cf in code_dir.rglob("*"):
+                    if cf.is_file() and not any(p in EXCLUDED_CODE_DIRS for p in cf.parts):
+                        allowed.add(cf.resolve())
+
+        for inp in d_meta.get("insumos") or []:
+            ref = inp.get("id_o_ruta", "") if isinstance(inp, dict) else str(inp)
+            try:
+                inp_p = resolve_artifact_by_id(paths, engagement_id, ref)
+                allowed.add(inp_p.resolve())
+            except FileNotFoundError:
+                pass
+
+    if meta.get("tipo") == "derivacion":
+        _add_derivation_and_inputs(resolved_artifact)
+    else:
+        for ev_ref in meta.get("sustento_evidencia") or []:
+            try:
+                allowed.add(resolve_artifact_by_id(paths, engagement_id, str(ev_ref)).resolve())
+            except FileNotFoundError:
+                pass
+        for der_ref in meta.get("sustento_derivaciones") or []:
+            try:
+                dp = resolve_artifact_by_id(paths, engagement_id, str(der_ref)).resolve()
+                _add_derivation_and_inputs(dp)
+            except FileNotFoundError:
+                pass
+
+    if ronda == 2 and prior_verdict_path and prior_verdict_path.is_file():
+        allowed.add(prior_verdict_path.resolve())
+
+    # Safety assertion: strictly scrub any forbidden Blind QA paths
+    forbidden_roots = (
+        (enc_dir / "Nodos").resolve(),
+        (enc_dir / "01_Plan.md").resolve(),
+        (paths.vault_root / "90_Bitacora").resolve(),
+        (paths.vault_root / "10_Clientes").resolve(),
+    )
+    sanitized = {
+        p
+        for p in allowed
+        if not any(p == fr or fr in p.parents for fr in forbidden_roots)
+    }
+    return frozenset(sanitized)

@@ -1,0 +1,13 @@
+filters:
+  and:
+    - 'tipo == "brief"'
+views:
+  - type: table
+    name: Encargos Activos M37
+    order:
+      - file.name
+      - id_encargo
+      - cliente
+      - nivel_rigor
+      - puerta_1_aprobada
+      - fecha

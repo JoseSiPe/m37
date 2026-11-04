@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "m37"
+version = "0.2.0"
+description = "Move 37 (M37) — Task-agnostic multi-model agentic microkernel"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "José Carlos Sierra" }
+]
+dependencies = [
+    "litellm>=1.50.0",
+    "pydantic>=2.7.0",
+    "python-frontmatter>=1.1.0",
+    "pyyaml>=6.0.1",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "markdown>=3.6",
+]
+
+[project.optional-dependencies]
+full = [
+    "duckdb>=1.1.0",
+    "fastmcp>=0.4.0",
+]
+data = [
+    "polars>=1.5.0",
+    "pyarrow>=17.0.0",
+    "trafilatura>=1.12.0",
+]
+dev = [
+    "pytest>=8.2.0",
+]
+
+[project.scripts]
+m37 = "m37.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+m37 = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+addopts = "-q"

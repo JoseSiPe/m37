@@ -1,0 +1,13 @@
+filters:
+  and:
+    - 'tipo == "hallazgo"'
+views:
+  - type: table
+    name: Cola de QA y Fuerza Epistémica
+    order:
+      - id
+      - encargo
+      - dominio
+      - fuerza_afirmacion
+      - estado_qa
+      - confianza

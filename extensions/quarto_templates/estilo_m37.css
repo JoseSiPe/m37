@@ -1,0 +1,20 @@
+/* M37 (Move 37) — Editorial Stylesheet for Quarto / Print Deliverables */
+body {
+  font-family: "Inter", "Segoe UI", -apple-system, sans-serif;
+  color: #16191f;
+  line-height: 1.65;
+}
+h1, h2, h3 {
+  color: #0f3d5e;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  border: 1px solid #d8dee6;
+  padding: 0.55rem 0.75rem;
+}
+th {
+  background-color: #f7f9fb;
+}

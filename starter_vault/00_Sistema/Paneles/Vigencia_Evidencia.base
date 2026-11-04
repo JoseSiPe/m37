@@ -1,0 +1,14 @@
+filters:
+  and:
+    - 'tipo == "evidencia"'
+views:
+  - type: table
+    name: Vigencia y Cuarentena de Evidencia
+    order:
+      - id
+      - titulo
+      - emisor_o_autor
+      - fecha_verificacion
+      - vigencia_dias_max
+      - cita_verificada
+      - invalidada

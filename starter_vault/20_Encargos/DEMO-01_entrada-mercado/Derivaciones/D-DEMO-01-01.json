@@ -1,0 +1,27 @@
+{
+  "id": "D-DEMO-01-01",
+  "tipo": "derivacion",
+  "encargo": "DEMO-01_entrada-mercado",
+  "metodo": "matriz-comparativa-alternativas",
+  "productor_modo": "estructuracion_analitica",
+  "productor_ref": "40_Metodos/matriz-comparativa-alternativas.md",
+  "productor_sha256": null,
+  "insumos": [
+    {
+      "id_o_ruta": "E-202610-001",
+      "sha256": "744b3daa8ab578d541e4e7519fe409efc1c300ea9268dd1a64e1a90c5c9dd0e7"
+    }
+  ],
+  "salidas": {
+    "van_musd": 2.45,
+    "tir_pct": 0.284,
+    "payback_meses": 17,
+    "van_estres_churn_musd": 1.62
+  },
+  "metadatos_metodo": {
+    "tasa_descuento_anual": 0.12,
+    "horizonte_meses": 36
+  },
+  "invalidada": false,
+  "motivo_invalidacion": null
+}

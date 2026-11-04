@@ -1,0 +1,15 @@
+---
+title: "Informe Ejecutivo M37"
+lang: es
+format:
+  html:
+    toc: true
+    css: estilo_m37.css
+  pdf:
+    toc: true
+    number-sections: true
+  docx:
+    toc: true
+---
+
+{{< include Informe.md >}}

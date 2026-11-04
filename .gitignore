@@ -1,0 +1,23 @@
+# Secretos y configuración local
+.env
+.env.*
+!.env.example
+
+# Entornos virtuales y cachés Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Workspaces locales de prueba e índices DuckDB (jamás deben subir a m37-core)
+workspaces/
+m37_workspace*/
+*.duckdb
+*.duckdb.wal
+.m37_locks/

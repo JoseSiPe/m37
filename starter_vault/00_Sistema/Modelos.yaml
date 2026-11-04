@@ -1,0 +1,147 @@
+version_catalogo: "2026.10"
+orquestador_por_defecto: "gemini_flash"
+
+modelos:
+  gemini_pro:
+    litellm_id: "gemini/gemini-3.1-pro-preview"
+    familia: "google"
+    credencial_env: "GEMINI_API_KEY"
+    ventana_max_tokens: 1000000
+    costo_usd_1m_in: 1.25
+    costo_usd_1m_out: 10.00
+    capacidades:
+      extraccion_fiel: 5
+      abstraccion_conceptual: 5
+      coherencia_documental: 5
+      ejecucion_formal: 5
+      critica_adversarial: 5
+    limites_operativos:
+      permitir_edit_quirurgico: true
+      temperatura_recomendada: 0.2
+    notas_orquestador: "Modelo Gemini 3.1 Pro (1M tokens) para razonamiento complejo, código SDD e investigación profunda."
+
+  gemini_flash:
+    litellm_id: "gemini/gemini-3.8-flash"
+    familia: "google"
+    credencial_env: "GEMINI_API_KEY"
+    ventana_max_tokens: 1000000
+    costo_usd_1m_in: 0.30
+    costo_usd_1m_out: 2.50
+    capacidades:
+      extraccion_fiel: 5
+      abstraccion_conceptual: 5
+      coherencia_documental: 5
+      ejecucion_formal: 5
+      critica_adversarial: 4
+    limites_operativos:
+      permitir_edit_quirurgico: true
+      temperatura_recomendada: 0.2
+    notas_orquestador: "Gemini 3.8 Flash (1M tokens): balance óptimo de velocidad y razonamiento agéntico (motor base de Antigravity)."
+
+  gemini_flash_lite:
+    litellm_id: "gemini/gemini-3.5-flash-lite"
+    familia: "google"
+    credencial_env: "GEMINI_API_KEY"
+    ventana_max_tokens: 1000000
+    costo_usd_1m_in: 0.10
+    costo_usd_1m_out: 0.40
+    capacidades:
+      extraccion_fiel: 5
+      abstraccion_conceptual: 3
+      coherencia_documental: 4
+      ejecucion_formal: 4
+      critica_adversarial: 3
+    limites_operativos:
+      permitir_edit_quirurgico: false
+      temperatura_recomendada: 0.1
+    notas_orquestador: "Gemini 3.5 Flash-Lite para extracción documental masiva de bajo costo; usar write_note completo."
+
+  claude_opus:
+    litellm_id: "anthropic/claude-opus-4-6"
+    familia: "anthropic"
+    credencial_env: "ANTHROPIC_API_KEY"
+    ventana_max_tokens: 200000
+    costo_usd_1m_in: 5.00
+    costo_usd_1m_out: 25.00
+    capacidades:
+      extraccion_fiel: 5
+      abstraccion_conceptual: 5
+      coherencia_documental: 5
+      ejecucion_formal: 5
+      critica_adversarial: 5
+    limites_operativos:
+      permitir_edit_quirurgico: true
+      temperatura_recomendada: 0.2
+    notas_orquestador: "Claude Opus 4.6 ($5/$25 por 1M tokens): máxima capacidad en abstracción conceptual, arbitraje entre dominios y ataque adversarial en QA L3/L4."
+
+  claude_sonnet:
+    litellm_id: "anthropic/claude-sonnet-4-5"
+    familia: "anthropic"
+    credencial_env: "ANTHROPIC_API_KEY"
+    ventana_max_tokens: 200000
+    costo_usd_1m_in: 3.00
+    costo_usd_1m_out: 15.00
+    capacidades:
+      extraccion_fiel: 5
+      abstraccion_conceptual: 5
+      coherencia_documental: 5
+      ejecucion_formal: 5
+      critica_adversarial: 5
+    limites_operativos:
+      permitir_edit_quirurgico: true
+      temperatura_recomendada: 0.2
+    notas_orquestador: "Excelente en construcción SDD/TDD, redacción ejecutiva sobria y crítica adversarial cruzada."
+
+  openai_flagship:
+    litellm_id: "openai/gpt-4.1"
+    familia: "openai"
+    credencial_env: "OPENAI_API_KEY"
+    ventana_max_tokens: 400000
+    costo_usd_1m_in: 2.00
+    costo_usd_1m_out: 8.00
+    capacidades:
+      extraccion_fiel: 5
+      abstraccion_conceptual: 5
+      coherencia_documental: 4
+      ejecucion_formal: 5
+      critica_adversarial: 5
+    limites_operativos:
+      permitir_edit_quirurgico: true
+      temperatura_recomendada: 0.15
+    notas_orquestador: "Alta precisión en ejecución formal, modelado cuantitativo, código SDD y QA cruzado."
+
+  deepseek_reasoner:
+    litellm_id: "deepseek/deepseek-reasoner"
+    familia: "deepseek"
+    credencial_env: "DEEPSEEK_API_KEY"
+    ventana_max_tokens: 128000
+    costo_usd_1m_in: 0.55
+    costo_usd_1m_out: 2.19
+    capacidades:
+      extraccion_fiel: 4
+      abstraccion_conceptual: 5
+      coherencia_documental: 3
+      ejecucion_formal: 5
+      critica_adversarial: 5
+    limites_operativos:
+      permitir_edit_quirurgico: false
+      temperatura_recomendada: 0.1
+    notas_orquestador: "Auditor adversarial independiente de alto rigor formal y bajo costo."
+
+  local_qwen:
+    litellm_id: "ollama/qwen2.5-coder:14b"
+    familia: "ollama_local"
+    credencial_env: "M37_ENABLE_LOCAL_OLLAMA"
+    ventana_max_tokens: 32768
+    costo_usd_1m_in: 0.00
+    costo_usd_1m_out: 0.00
+    capacidades:
+      extraccion_fiel: 3
+      abstraccion_conceptual: 3
+      coherencia_documental: 3
+      ejecucion_formal: 4
+      critica_adversarial: 3
+    limites_operativos:
+      permitir_edit_quirurgico: false
+      temperatura_recomendada: 0.1
+    notas_orquestador: "Ejecución 100% air-gapped local activando M37_ENABLE_LOCAL_OLLAMA=1 en .env."
