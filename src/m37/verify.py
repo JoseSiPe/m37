@@ -14,6 +14,8 @@ from m37.config import WorkspacePaths, get_core_repo_root
 from m37.guards import (
     EXCLUDED_CODE_DIRS,
     RECEIPT_FILENAME,
+    AgentExecutionContext,
+    ExecutionGuard,
     QuarantinedArtifactError,
     compute_code_tree_sha256,
     compute_inputs_hash,
@@ -30,6 +32,7 @@ from m37.schemas import (
     FindingContract,
     QAVerdictContract,
     RigorLevel,
+    compute_finding_substantive_sha256,
     dump_markdown_note,
     extract_wikilink_id,
     parse_raw_artifact,
@@ -224,13 +227,36 @@ def _load_and_run_method_validator_plugin(
     return [f"No se encontró el validador_plugin {plugin_name!r} requerido por 40_Metodos/{bare_metodo}.md."]
 
 
+def _extract_json_dict_from_stdout(stdout: str) -> dict[str, Any] | None:
+    stripped = stdout.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    for line in reversed([ln.strip() for ln in stripped.splitlines() if ln.strip()]):
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
 def verify_derivation_phase_a(
     paths: WorkspacePaths,
     engagement_id: str,
     derivation_path: Path,
     rigor: RigorLevel = "L3",
+    *,
+    rerun: bool = False,
 ) -> PhaseAResult:
-    """Mechanical Phase A check for a Derivation artifact (D-*.json or D-*.md)."""
+    """Mechanical Phase A check for a Derivation artifact (D-*.json or D-*.md), with optional deterministic script --rerun."""
     if not derivation_path.is_file():
         return PhaseAResult(passed=False, artifact_id=derivation_path.stem, errors=["Archivo de Derivación no existe."])
 
@@ -276,8 +302,43 @@ def verify_derivation_phase_a(
         script_file = next((p for p in script_candidates if p.is_file()), None)
         if script_file is None:
             errors.append(f"Script productor no encontrado para {validated.id}: {validated.productor_ref!r}")
-        elif validated.productor_sha256 and sha256_file(script_file) != validated.productor_sha256:
+        elif not validated.productor_sha256:
+            errors.append(f"La Derivación {validated.id} con productor_modo='script' debe declarar productor_sha256.")
+        elif sha256_file(script_file) != validated.productor_sha256:
             errors.append(f"El script {validated.productor_ref!r} cambió respecto a productor_sha256.")
+        elif rerun:
+            guard = ExecutionGuard(
+                paths,
+                AgentExecutionContext(
+                    engagement_id=engagement_id,
+                    client_id="VERIFY",
+                    node_id="VERIFY-RERUN",
+                    profile="analitico",
+                ),
+            )
+            try:
+                run_res = guard.run_sandbox_script(script_file)
+                if run_res["exit_code"] != 0:
+                    errors.append(
+                        f"Re-ejecución (--rerun) de {validated.productor_ref!r} falló con exit_code={run_res['exit_code']}: "
+                        f"{run_res['stderr']}"
+                    )
+                else:
+                    recomputed = _extract_json_dict_from_stdout(str(run_res["stdout"]))
+                    if recomputed is None:
+                        errors.append(
+                            f"Re-ejecución (--rerun) de {validated.productor_ref!r} no emitió un objeto JSON verificable en stdout."
+                        )
+                    else:
+                        for k, expected_v in validated.salidas.items():
+                            found, actual_v = _lookup_nested_key(recomputed, k)
+                            if not found or not _values_equal(expected_v, actual_v):
+                                errors.append(
+                                    f"Irreproducibilidad numérica en {validated.id}: salida {k!r} declarada={expected_v!r} "
+                                    f"vs recalculada={actual_v!r}."
+                                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"Error al re-ejecutar script {validated.productor_ref!r}: {exc}")
 
     if validated.productor_modo == "verificacion_codigo":
         errors.extend(verify_sdd_code_derivation(paths, engagement_id, validated))
@@ -298,6 +359,7 @@ def verify_finding_phase_a(
     *,
     r1_finding_snapshot: FindingContract | dict[str, Any] | str | None = None,
     r1_verdict: QAVerdictContract | Path | None = None,
+    rerun: bool = False,
 ) -> PhaseAResult:
     """SPEC-03 §2.2 & §2.3: Mechanical Phase A check + Ronda 2 Anti-Cosmetic Concession Gate."""
     if not finding_path.is_file():
@@ -361,7 +423,7 @@ def verify_finding_phase_a(
             errors.append(str(exc))
             continue
 
-        der_res = verify_derivation_phase_a(paths, engagement_id, der_path, rigor=rigor)
+        der_res = verify_derivation_phase_a(paths, engagement_id, der_path, rigor=rigor, rerun=rerun)
         if not der_res.passed:
             errors.extend(f"[{der_res.artifact_id}] {e}" for e in der_res.errors)
         else:
@@ -457,11 +519,42 @@ def verify_finding_phase_a(
     )
 
 
+def has_valid_content_bound_qa_verdict(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    finding_id: str,
+    finding_path: Path,
+) -> tuple[bool, bool]:
+    """Return (has_any_verdict_for_finding, has_matching_hash_approved_verdict)."""
+    qa_dir = paths.engagement_dir(engagement_id) / "QA"
+    if not qa_dir.is_dir() or not finding_path.is_file():
+        return False, False
+    live_sha = compute_finding_substantive_sha256(finding_path)
+    saw_verdict = False
+    for vfile in qa_dir.glob("V-*.md"):
+        try:
+            v_obj, _, _ = validate_artifact_content(
+                vfile.read_text(encoding="utf-8"),
+                suffix=".md",
+                expected_tipo="veredicto_qa",
+            )
+            assert isinstance(v_obj, QAVerdictContract)
+            if extract_wikilink_id(v_obj.artefacto_auditado) != finding_id:
+                continue
+            saw_verdict = True
+            if v_obj.decision in ("aceptar", "aceptar_con_correcciones"):
+                if v_obj.sha256_artefacto_auditado == live_sha:
+                    return True, True
+        except ContractValidationError:
+            continue
+    return saw_verdict, False
+
+
 def refresh_engagement_hashes_and_quarantine(
     paths: WorkspacePaths,
     engagement_id: str,
 ) -> dict[str, list[str]]:
-    """Propagate upstream quarantine -> 'invalidado' and upstream hash edits -> 'desactualizado' across an engagement."""
+    """Propagate upstream quarantine -> 'invalidado' and upstream/post-QA edits -> 'desactualizado' across an engagement."""
     enc_dir = paths.engagement_dir(engagement_id)
     deriv_dir = enc_dir / "Derivaciones"
     hallazgos_dir = enc_dir / "Hallazgos"
@@ -502,7 +595,7 @@ def refresh_engagement_hashes_and_quarantine(
                     summary["derivaciones_invalidadas"].append(dpath.stem)
                     break
 
-    # Step 2: Cascade quarantine ('invalidado') and hash changes ('desactualizado') into Findings
+    # Step 2: Cascade quarantine ('invalidado'), input hash changes, and post-QA content tampering (P3) into Findings
     if hallazgos_dir.is_dir():
         for hpath in sorted(hallazgos_dir.glob("H-*.md")):
             try:
@@ -536,7 +629,20 @@ def refresh_engagement_hashes_and_quarantine(
                 summary["desactualizados"].append(validated.id)
                 continue
 
-            if live_hash != validated.hash_insumos:
+            # Check if finding content was modified after its QA verdict was issued (P3)
+            saw_verdict, verdict_matches_content = has_valid_content_bound_qa_verdict(
+                paths,
+                engagement_id,
+                validated.id,
+                hpath,
+            )
+            tampered_after_qa = (
+                meta.get("estado_qa") in ("aprobado", "aprobado_con_correcciones")
+                and saw_verdict
+                and not verdict_matches_content
+            )
+
+            if live_hash != validated.hash_insumos or tampered_after_qa:
                 if meta.get("estado_qa") != "desactualizado":
                     meta["estado_qa"] = "desactualizado"
                     write_utf8_lf(hpath, dump_markdown_note(meta, body))

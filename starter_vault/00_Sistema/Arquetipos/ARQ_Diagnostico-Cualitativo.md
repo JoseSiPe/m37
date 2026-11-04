@@ -22,7 +22,7 @@ nodos:
     max_turns: 14
   - id: N-02
     objetivo: "Sintetizar evidencia en Hallazgos estructurados con contrahipótesis probadas y calibración epistémica."
-    perfil_herramientas: documental
+    perfil_herramientas: analitico
     rol_tarea: analisis-sintesis
     eje_dominante: abstraccion_conceptual
     metodo: matriz-comparativa-alternativas
@@ -62,5 +62,5 @@ nodos:
 
 ## Secuencia Canónica de Nodos
 1. **`N-01` (`documental` · `evidencia`):** Levantamiento y verificación de evidencia primaria (`E-*` / `EI-*`).
-2. **`N-02` (`documental` · `analisis-sintesis`):** Síntesis en `Hallazgos/H-*.md` con contrahipótesis probadas y calibración epistémica + QA Ciego Cruzado.
+2. **`N-02` (`analitico` · `analisis-sintesis`):** Síntesis en `Hallazgos/H-*.md` con contrahipótesis probadas y calibración epistémica + QA Ciego Cruzado.
 3. **`N-03` (`editorial` · `redaccion`):** Redacción de `Entregables/Informe.md` con trazabilidad bloque a bloque.

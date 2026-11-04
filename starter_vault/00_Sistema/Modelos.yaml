@@ -29,14 +29,14 @@ modelos:
     costo_usd_1m_out: 2.50
     capacidades:
       extraccion_fiel: 5
-      abstraccion_conceptual: 5
-      coherencia_documental: 5
-      ejecucion_formal: 5
+      abstraccion_conceptual: 4
+      coherencia_documental: 4
+      ejecucion_formal: 4
       critica_adversarial: 4
     limites_operativos:
       permitir_edit_quirurgico: true
       temperatura_recomendada: 0.2
-    notas_orquestador: "Gemini 3.8 Flash (1M tokens): balance óptimo de velocidad y razonamiento agéntico (motor base de Antigravity)."
+    notas_orquestador: "Gemini 3.8 Flash (1M tokens): balance óptimo de velocidad y razonamiento agéntico para extracción fiel y encargos L1/L2."
 
   gemini_flash_lite:
     litellm_id: "gemini/gemini-3.5-flash-lite"

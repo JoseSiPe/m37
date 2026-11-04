@@ -30,6 +30,7 @@ from m37.schemas import (
     validate_artifact_content,
 )
 from m37.verify import (
+    has_valid_content_bound_qa_verdict,
     refresh_engagement_hashes_and_quarantine,
     verify_derivation_phase_a,
     verify_finding_phase_a,
@@ -166,26 +167,15 @@ def _lookup_derivation_value(salidas: dict[str, Any], dotted_key: str) -> Any:
     return cur
 
 
-def _has_approved_qa_verdict(paths: WorkspacePaths, engagement_id: str, finding_id: str) -> bool:
-    qa_dir = paths.engagement_dir(engagement_id) / "QA"
-    if not qa_dir.is_dir():
-        return False
-    for vfile in qa_dir.glob("V-*.md"):
-        try:
-            v_obj, _, _ = validate_artifact_content(
-                vfile.read_text(encoding="utf-8"),
-                suffix=".md",
-                expected_tipo="veredicto_qa",
-            )
-            assert isinstance(v_obj, QAVerdictContract)
-            if extract_wikilink_id(v_obj.artefacto_auditado) == finding_id and v_obj.decision in (
-                "aceptar",
-                "aceptar_con_correcciones",
-            ):
-                return True
-        except ContractValidationError:
-            continue
-    return False
+def _has_approved_qa_verdict(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    finding_id: str,
+    finding_path: Path | None = None,
+) -> bool:
+    target_path = finding_path or resolve_artifact_by_id(paths, engagement_id, finding_id)
+    _, matches = has_valid_content_bound_qa_verdict(paths, engagement_id, finding_id, target_path)
+    return matches
 
 
 EXECUTIVE_CSS = """

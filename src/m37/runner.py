@@ -29,14 +29,36 @@ litellm.suppress_debug_info = True
 
 
 ALL_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "allocate_next_id": {
+        "type": "function",
+        "function": {
+            "name": "allocate_next_id",
+            "description": "Reserva atómicamente el siguiente ID secuencial canónico para un artefacto (prefijos válidos: E, EI, D, H, V, N).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prefix": {
+                        "type": "string",
+                        "enum": ["E", "EI", "D", "H", "V", "N"],
+                        "description": "Prefijo de artefacto a numerar.",
+                    }
+                },
+                "required": ["prefix"],
+            },
+        },
+    },
     "read_file": {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Lee un archivo autorizado del workspace o del Vault.",
+            "description": "Lee un archivo autorizado del workspace o del Vault (paginado a máx 25,000 caracteres por llamada).",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "Ruta relativa al workspace o al Vault."}},
+                "properties": {
+                    "path": {"type": "string", "description": "Ruta relativa al workspace o al Vault."},
+                    "offset": {"type": "integer", "default": 0, "description": "Desplazamiento inicial en caracteres."},
+                    "limit": {"type": "integer", "default": 25000, "description": "Máximo de caracteres (tope 25000)."},
+                },
                 "required": ["path"],
             },
         },
@@ -162,7 +184,7 @@ ALL_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "run_sandbox_script",
-            "description": "Ejecuta un script Python aislado en analisis/<ID-Encargo>/ con bloqueo de escritura sobre vault/.",
+            "description": "Ejecuta un script Python con guardarraíl en analisis/<ID-Encargo>/ y bloqueo de escritura sobre vault/.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -243,28 +265,55 @@ def append_episodic_event(episodios_path: Path, event: dict[str, Any]) -> None:
         fh.write(line)
 
 
+def _require_args(tool_name: str, args: dict[str, Any], required: tuple[str, ...]) -> None:
+    missing = [k for k in required if k not in args]
+    if missing:
+        raise ValueError(
+            f"Argumentos faltantes o mal nombrados en {tool_name!r}: faltan {missing} (recibidos: {sorted(args.keys())})."
+        )
+
+
 def _dispatch_guard_tool(guard: ExecutionGuard, tool_name: str, args: dict[str, Any]) -> Any:
+    if not isinstance(args, dict):
+        raise ValueError(f"Los argumentos de {tool_name!r} deben ser un objeto JSON clave-valor.")
+    if tool_name == "allocate_next_id":
+        _require_args(tool_name, args, ("prefix",))
+        return {"id": guard.allocate_id(str(args["prefix"]))}
     if tool_name == "read_file":
-        return guard.read_file(args["path"])
+        _require_args(tool_name, args, ("path",))
+        return guard.read_file(
+            args["path"],
+            offset=int(args.get("offset", 0) or 0),
+            limit=int(args.get("limit", 25_000) or 25_000),
+        )
     if tool_name == "list_files":
         return guard.list_files(args.get("directory", "vault"))
     if tool_name == "grep_vault":
+        _require_args(tool_name, args, ("pattern",))
         return guard.grep_vault(args["pattern"], args.get("directory", "vault"))
     if tool_name == "write_note":
+        _require_args(tool_name, args, ("path", "content"))
         return {"written": guard.write_note(args["path"], args["content"])}
     if tool_name == "edit_note":
+        _require_args(tool_name, args, ("path", "old_text", "new_text"))
         return {"edited": guard.edit_note(args["path"], args["old_text"], args["new_text"])}
     if tool_name == "write_code_file":
+        _require_args(tool_name, args, ("path", "content"))
         return {"written_code": guard.write_code_file(args["path"], args["content"])}
     if tool_name == "edit_code_file":
+        _require_args(tool_name, args, ("path", "old_text", "new_text"))
         return {"edited_code": guard.edit_code_file(args["path"], args["old_text"], args["new_text"])}
     if tool_name == "run_verification_cmd":
+        _require_args(tool_name, args, ("cmd",))
         return guard.run_verification_cmd(args["cmd"])
     if tool_name == "write_sandbox_script":
+        _require_args(tool_name, args, ("script_rel_path", "content"))
         return {"written_script": guard.write_sandbox_script(args["script_rel_path"], args["content"])}
     if tool_name == "run_sandbox_script":
+        _require_args(tool_name, args, ("script_path",))
         return guard.run_sandbox_script(args["script_path"], args.get("args"))
     if tool_name == "web_fetch_clean":
+        _require_args(tool_name, args, ("url",))
         return guard.web_fetch_clean(args["url"])
     raise GuardViolationError(f"Herramienta desconocida o no registrada: {tool_name!r}")
 
@@ -388,13 +437,22 @@ def execute_stateless_node_loop(
                 tool_output = (
                     result_obj if isinstance(result_obj, str) else json.dumps(result_obj, ensure_ascii=False)
                 )
-            except (GuardViolationError, ContractValidationError, FileNotFoundError, ValueError) as exc:
+            except (
+                GuardViolationError,
+                ContractValidationError,
+                FileNotFoundError,
+                ValueError,
+                KeyError,
+                TypeError,
+            ) as exc:
                 err_msg = f"ERROR_GUARDIA ({type(exc).__name__}): {exc}"
-                if isinstance(exc, GuardViolationError):
+                if isinstance(exc, (GuardViolationError, ValueError, KeyError, TypeError)):
                     guard_violations.append(err_msg)
                 if isinstance(exc, ContractValidationError):
                     contract_errors += 1
                 tool_output = err_msg
+            except Exception as exc:  # noqa: BLE001 - P8: never crash node loop on unexpected tool error
+                tool_output = f"ERROR_HERRAMIENTA ({type(exc).__name__}): {exc}"
 
             messages.append(
                 {

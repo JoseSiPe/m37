@@ -234,6 +234,21 @@ class EvidenceContract(BaseModel):
         return self
 
 
+import hashlib
+
+
+def _contains_numeric_value(val: Any) -> bool:
+    if isinstance(val, bool):
+        return False
+    if isinstance(val, (int, float)):
+        return True
+    if isinstance(val, dict):
+        return any(_contains_numeric_value(v) for v in val.values())
+    if isinstance(val, (list, tuple)):
+        return any(_contains_numeric_value(v) for v in val)
+    return False
+
+
 # 4. CONTRATO DE DERIVACIÓN OPCIONAL (Derivaciones/D-XX.json o .md)
 class InputHashRef(BaseModel):
     id_o_ruta: str
@@ -258,6 +273,11 @@ class DerivationContract(BaseModel):
     def exigir_motivo_si_derivacion_invalidada(self) -> DerivationContract:
         if self.invalidada and not self.motivo_invalidacion:
             raise ValueError("Marcar invalidada=True exige registrar motivo_invalidacion.")
+        if self.productor_modo == "estructuracion_analitica" and _contains_numeric_value(self.salidas):
+            raise ValueError(
+                "Prohibido usar productor_modo='estructuracion_analitica' con salidas numéricas cuantitativas; "
+                "toda cifra debe generarse con productor_modo='script' o 'verificacion_codigo' reproducible."
+            )
         return self
 
 
@@ -322,6 +342,7 @@ class QAVerdictContract(BaseModel):
     tipo: Literal["veredicto_qa"] = "veredicto_qa"
     encargo: str
     artefacto_auditado: str
+    sha256_artefacto_auditado: str | None = None
     ronda: int = Field(ge=1, le=2)
     modelo_auditor: str
     familia_auditor: str
@@ -462,3 +483,18 @@ def validate_artifact_content(
         validate_markdown_headings(tipo, body)
 
     return validated, metadata, body
+
+
+def compute_finding_substantive_sha256(content_or_path: str | Path) -> str:
+    """Compute SHA-256 of a Finding note's substantive content (excluding kernel-managed estado_qa)."""
+    if isinstance(content_or_path, Path):
+        raw_text = content_or_path.read_text(encoding="utf-8")
+        suffix = content_or_path.suffix
+    else:
+        raw_text = content_or_path
+        suffix = ".md"
+    meta, body = parse_raw_artifact(raw_text, suffix=suffix)
+    canonical_meta = {k: v for k, v in meta.items() if k != "estado_qa"}
+    canonical = dump_markdown_note(canonical_meta, body).replace("\r\n", "\n")
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+

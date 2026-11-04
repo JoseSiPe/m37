@@ -248,7 +248,7 @@ def recommend_routing_for_axis(
     ]
     pool_after_ctx = comfortable if comfortable else eligible
 
-    # Rule 4 (SPEC-02 §3.2 #4): Episodic penalty if R1 QA rejection rate > 35% for this dominio/metodo
+    # Rule 4 (SPEC-02 §3.2 #4): Episodic penalty if R1 QA rejection rate > 35% for this dominio/metodo (with min sample n >= 3)
     rejection_stats = compute_episodic_rejection_rates(
         episodios_path,
         dominio=dominio,
@@ -257,7 +257,7 @@ def recommend_routing_for_axis(
     penalized_aliases = {
         alias: rate
         for alias, (rate, total) in rejection_stats.items()
-        if total >= 1 and rate > 0.35
+        if total >= 3 and rate > 0.35
     }
     unpenalized = [(a, e) for a, e in pool_after_ctx if a not in penalized_aliases]
     candidate_pool = unpenalized if unpenalized else pool_after_ctx

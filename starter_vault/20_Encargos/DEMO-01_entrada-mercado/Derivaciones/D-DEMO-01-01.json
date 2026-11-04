@@ -3,9 +3,9 @@
   "tipo": "derivacion",
   "encargo": "DEMO-01_entrada-mercado",
   "metodo": "matriz-comparativa-alternativas",
-  "productor_modo": "estructuracion_analitica",
-  "productor_ref": "40_Metodos/matriz-comparativa-alternativas.md",
-  "productor_sha256": null,
+  "productor_modo": "script",
+  "productor_ref": "analisis/DEMO-01_entrada-mercado/modelo_van.py",
+  "productor_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "insumos": [
     {
       "id_o_ruta": "E-202610-001",
