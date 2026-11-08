@@ -106,6 +106,9 @@ class PermissionDeniedError(GuardViolationError):
     """Raised when an agent attempts an unauthorized tool, path, client, or Blind QA access."""
 
 
+SandboxViolationError = PermissionDeniedError
+
+
 class QuarantinedArtifactError(GuardViolationError):
     """Raised when a productive node attempts to read or cite an artifact with invalidada=True."""
 
@@ -123,6 +126,8 @@ class AgentExecutionContext:
     model_alias: str = "desconocido"
     model_family: str = "desconocida"
     allow_surgical_edit: bool = True
+    allow_compute: bool = True
+    assigned_qa_target: str | None = None
     blind_qa_allowlist: frozenset[Path] = field(default_factory=frozenset)
     env_secrets: tuple[str, ...] = field(default_factory=tuple)
     base_env: Mapping[str, str] = field(default_factory=dict)
@@ -461,6 +466,76 @@ def _build_scrubbed_subprocess_env(base_env: Mapping[str, str]) -> dict[str, str
     return clean
 
 
+def _parse_json_dict_from_stdout(stdout: str) -> dict[str, Any] | None:
+    """Parse a JSON dictionary printed by an analytical script on stdout (whole stdout or last non-empty line)."""
+    stripped = stdout.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(stripped.splitlines()):
+        line_s = line.strip()
+        if line_s.startswith("{") and line_s.endswith("}"):
+            try:
+                parsed = json.loads(line_s)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def _validate_public_http_url(url: str) -> None:
+    """Block SSRF against loopback, RFC1918 private networks, link-local (169.254.169.254), and internal hosts."""
+    import ipaddress
+    import socket
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise PermissionDeniedError("Esquema URL prohibido en web_fetch_clean: solo se acepta http:// o https://.")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise PermissionDeniedError("URL sin hostname válido en web_fetch_clean.")
+    if host in ("localhost", "0.0.0.0") or host.endswith((".local", ".internal", ".localhost")):
+        raise PermissionDeniedError(
+            f"Violación SSRF en web_fetch_clean: host local/interno bloqueado ({host!r})."
+        )
+
+    def _check_ip(ip_str: str) -> None:
+        ip_obj = ipaddress.ip_address(ip_str)
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        ):
+            raise PermissionDeniedError(
+                f"Violación SSRF en web_fetch_clean: dirección IP no pública bloqueada ({ip_str!r})."
+            )
+
+    try:
+        _check_ip(host)
+        return
+    except ValueError:
+        pass
+
+    try:
+        addr_infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror:
+        return
+    for info in addr_infos:
+        sockaddr = info[4]
+        if sockaddr and isinstance(sockaddr[0], str):
+            _check_ip(sockaddr[0])
+
+
 class ExecutionGuard:
     """Deterministic Python enforcement layer mediating every agent tool invocation."""
 
@@ -502,7 +577,7 @@ class ExecutionGuard:
         ws_root = self.paths.workspace_root.resolve()
         if resolved != ws_root and ws_root not in resolved.parents:
             raise PermissionDeniedError(
-                f"Acceso fuera del perímetro del workspace bloqueado: {rel_or_abs!r} -> {resolved}"
+                f"Acceso fuera del perímetro del workspace bloqueado: {str(rel_or_abs)!r}"
             )
         if resolved.name == ".env" or resolved.name.startswith(".env."):
             raise PermissionDeniedError("Lectura o escritura de archivos .env estrictamente prohibida.")
@@ -522,7 +597,7 @@ class ExecutionGuard:
         if _belongs_to_other_engagement(self.paths, self.ctx.engagement_id, resolved):
             raise PermissionDeniedError(
                 f"Violación de Muralla China (encargo): el nodo de {self.ctx.engagement_id!r} "
-                f"no puede acceder a artefactos de otro encargo ({resolved})."
+                f"no puede acceder a artefactos de otro encargo ({resolved.name!r})."
             )
 
     def _is_episodic_memory_path(self, resolved: Path) -> bool:
@@ -549,7 +624,7 @@ class ExecutionGuard:
         if self.ctx.profile == "qa_ciego":
             if resolved not in self.ctx.blind_qa_allowlist:
                 raise PermissionDeniedError(
-                    f"Violación de QA Ciego: el archivo {resolved.name!r} ({resolved}) no está en la "
+                    f"Violación de QA Ciego: el archivo {resolved.name!r} no está en la "
                     "lista blanca estricta del artefacto auditado."
                 )
 
@@ -613,7 +688,7 @@ class ExecutionGuard:
             if qa_dir in resolved.parents and resolved.suffix.lower() == ".md":
                 return "veredicto_qa"
             raise PermissionDeniedError(
-                f"El perfil 'qa_ciego' solo puede escribir veredictos en QA/V-*.md (intentó: {resolved})."
+                f"El perfil 'qa_ciego' solo puede escribir veredictos en QA/V-*.md (intentó: {resolved.name!r})."
             )
 
         if profile == "orquestador":
@@ -622,7 +697,7 @@ class ExecutionGuard:
             if nodos_dir in resolved.parents and resolved.suffix.lower() == ".md":
                 return "nodo"
             raise PermissionDeniedError(
-                f"El perfil 'orquestador' solo puede escribir 01_Plan.md y Nodos/N-*.md (intentó: {resolved})."
+                f"El perfil 'orquestador' solo puede escribir 01_Plan.md y Nodos/N-*.md (intentó: {resolved.name!r})."
             )
 
         if profile == "documental":
@@ -632,7 +707,7 @@ class ExecutionGuard:
                 return "evidencia"
             raise PermissionDeniedError(
                 f"Separación de poderes: el perfil 'documental' solo puede crear Evidencia append-only en "
-                f"30_Evidencia_Publica/ o Evidencia_Interna/ (intentó escribir en: {resolved})."
+                f"30_Evidencia_Publica/ o Evidencia_Interna/ (intentó escribir en: {resolved.name!r})."
             )
 
         if profile == "analitico":
@@ -643,7 +718,7 @@ class ExecutionGuard:
             if procesados_dir in resolved.parents:
                 return None
             raise PermissionDeniedError(
-                f"El perfil 'analitico' solo puede escribir notas en Derivaciones/, Hallazgos/ o datos/<encargo>/procesados/ (intentó: {resolved})."
+                f"El perfil 'analitico' solo puede escribir notas en Derivaciones/, Hallazgos/ o datos/<encargo>/procesados/ (intentó: {resolved.name!r})."
             )
 
         if profile == "construccion":
@@ -652,17 +727,69 @@ class ExecutionGuard:
             if hallazgos_dir in resolved.parents:
                 return "hallazgo"
             raise PermissionDeniedError(
-                f"El perfil 'construccion' debe usar write_code_file para código y write_note solo para Derivaciones/ o Hallazgos/ (intentó: {resolved})."
+                f"El perfil 'construccion' debe usar write_code_file para código y write_note solo para Derivaciones/ o Hallazgos/ (intentó: {resolved.name!r})."
             )
 
         if profile == "editorial":
             if entregables_dir in resolved.parents and resolved.suffix.lower() == ".md":
                 return None
             raise PermissionDeniedError(
-                f"El perfil 'editorial' solo puede escribir borradores en Entregables/*.md (intentó: {resolved})."
+                f"El perfil 'editorial' solo puede escribir borradores en Entregables/*.md (intentó: {resolved.name!r})."
             )
 
         raise PermissionDeniedError(f"Perfil desconocido {profile!r}: escritura denegada.")
+
+    def _verify_evidence_snapshot_extract(self, meta: dict[str, Any], body: str) -> tuple[bool, str | None]:
+        """Kernel-only verification of cita_verificada: requires a real snapshot file containing the verbatim extract."""
+        snap_ref = meta.get("snapshot_local")
+        if not snap_ref or not str(snap_ref).strip():
+            # Agents cannot self-certify cita_verificada without a local snapshot
+            meta["cita_verificada"] = False
+            meta["hash_snapshot"] = None
+            return False, None
+
+        try:
+            snap_path = self._resolve_workspace_path(str(snap_ref).strip())
+            self._enforce_chinese_wall(snap_path)
+        except Exception:
+            meta["cita_verificada"] = False
+            meta["hash_snapshot"] = None
+            return False, None
+
+        if not snap_path.is_file():
+            meta["cita_verificada"] = False
+            meta["hash_snapshot"] = None
+            return False, None
+
+        computed_hash = sha256_file(snap_path)
+        meta["hash_snapshot"] = computed_hash
+        snap_text_norm = re.sub(r"\s+", " ", snap_path.read_text(encoding="utf-8", errors="replace")).strip().lower()
+
+        # Extract text under '## Extracto o referencia verificable'
+        extract_lines: list[str] = []
+        in_extract = False
+        for line in body.splitlines():
+            s = line.strip()
+            if s.startswith("## "):
+                if s.lower().startswith("## extracto"):
+                    in_extract = True
+                    continue
+                elif in_extract:
+                    break
+            elif in_extract and s:
+                extract_lines.append(s)
+
+        extract_raw = " ".join(extract_lines).strip()
+        # Look for quoted text "..." first, otherwise use the whole extract block
+        quoted = [q.strip() for q in re.findall(r'["«“]([^"»”]{12,})["»”]', extract_raw)]
+        candidates = quoted if quoted else ([extract_raw] if len(extract_raw) >= 12 else [])
+
+        if candidates and all(re.sub(r"\s+", " ", c).strip().lower() in snap_text_norm for c in candidates):
+            meta["cita_verificada"] = True
+            return True, computed_hash
+        else:
+            meta["cita_verificada"] = False
+            return False, computed_hash
 
     def _validate_and_prepare_note(self, resolved: Path, content: str, expected_tipo: str | None) -> str:
         """Validate Pydantic contract, enforce quarantine checks, strip agent-forged governance state, and inject hashes."""
@@ -689,7 +816,10 @@ class ExecutionGuard:
                         "guardarse en 30_Evidencia_Publica/; usa Evidencia_Interna/ con visibilidad='interna_encargo'."
                     )
                 if self.ctx.client_id and len(self.ctx.client_id.strip()) >= 2:
-                    client_pat = re.compile(rf"\b{re.escape(self.ctx.client_id.strip())}\b", re.IGNORECASE)
+                    client_pat = re.compile(
+                        rf"(?<![A-Za-z0-9]){re.escape(self.ctx.client_id.strip())}(?![A-Za-z0-9])",
+                        re.IGNORECASE,
+                    )
                     if client_pat.search(content):
                         raise PermissionDeniedError(
                             f"Violación de Muralla China: prohibido mencionar al cliente {self.ctx.client_id!r} en "
@@ -702,14 +832,31 @@ class ExecutionGuard:
                     )
                 meta["encargo_origen"] = self.ctx.engagement_id
 
+            # Rule Point 5: Evidence cannot self-certify cita_verificada; kernel verifies against snapshot_local
+            self._verify_evidence_snapshot_extract(meta, body)
+
         elif expected_tipo == "plan":
-            # Rule P4: Agents (including orquestador) can NEVER approve human Gate 2
+            # Rule P4 & Point 9: Agents (including orquestador) can NEVER approve human Gate 2 or stamp gate hashes
             meta["puerta_2_aprobada"] = False
+            meta.pop("puerta_2_sha256", None)
+            meta.pop("puerta_2_aprobado_por", None)
+            meta.pop("puerta_2_fecha_utc", None)
 
         elif expected_tipo == "nodo":
-            # Rule P4: Agents (including orquestador) can NEVER pre-mark a node as aceptado/entregado
+            # Rule P4 & Point 9: Agents (including orquestador) can NEVER pre-mark a node as aceptado/entregado,
+            # and writing any node revokes prior Gate 2 approval on 01_Plan.md
             meta["estado"] = "pendiente"
             meta["rondas_qa"] = 0
+            plan_file = enc_dir / "01_Plan.md"
+            if plan_file.is_file():
+                try:
+                    p_meta, p_body = parse_raw_artifact(plan_file.read_text(encoding="utf-8"), suffix=".md")
+                    if p_meta.get("puerta_2_aprobada") or p_meta.get("puerta_2_sha256"):
+                        p_meta["puerta_2_aprobada"] = False
+                        p_meta.pop("puerta_2_sha256", None)
+                        write_utf8_lf(plan_file, dump_markdown_note(p_meta, p_body))
+                except Exception:
+                    pass
 
         elif expected_tipo == "derivacion":
             # Verify all upstream inputs exist and are not quarantined
@@ -731,6 +878,38 @@ class ExecutionGuard:
                 normalized_insumos.append({"id_o_ruta": ref, "sha256": sha256_file(art_path)})
             meta["insumos"] = normalized_insumos
 
+            # Rule Point 4: If productor_modo == 'script', the kernel executes the script and stamps salidas + productor_sha256
+            if meta.get("productor_modo") == "script":
+                prod_ref = str(meta.get("productor_ref") or "").strip()
+                if not prod_ref:
+                    raise ContractValidationError("Derivación con productor_modo='script' requiere productor_ref.")
+                analisis_enc = (self.paths.analisis_root / self.ctx.engagement_id).resolve()
+                script_candidates = [
+                    (self.paths.workspace_root / prod_ref).resolve(),
+                    (analisis_enc / prod_ref).resolve(),
+                ]
+                script_file = next(
+                    (p for p in script_candidates if p.is_file() and analisis_enc in p.parents),
+                    None,
+                )
+                if script_file is None:
+                    raise ContractValidationError(
+                        f"El script productor {prod_ref!r} no existe dentro de analisis/{self.ctx.engagement_id}/."
+                    )
+                run_res = self._run_sandbox_script_internal(script_file)
+                if run_res["exit_code"] != 0:
+                    raise ContractValidationError(
+                        f"El script productor {prod_ref!r} falló al ejecutarse (exit_code={run_res['exit_code']}): "
+                        f"{run_res['stderr']}"
+                    )
+                recomputed = _parse_json_dict_from_stdout(str(run_res["stdout"]))
+                if not recomputed:
+                    raise ContractValidationError(
+                        f"El script productor {prod_ref!r} debe imprimir un objeto JSON no vacío en stdout con las salidas."
+                    )
+                meta["productor_sha256"] = run_res["script_sha256"]
+                meta["salidas"] = recomputed
+
         elif expected_tipo == "hallazgo":
             ev_refs = [str(x) for x in (meta.get("sustento_evidencia") or [])]
             der_refs = [str(x) for x in (meta.get("sustento_derivaciones") or [])]
@@ -749,10 +928,20 @@ class ExecutionGuard:
             meta["modelo_auditor"] = self.ctx.model_alias
             meta["familia_auditor"] = self.ctx.model_family
             meta["revision_ciega_verificada"] = True
-            # Rule P3: Cryptographically bind the QA verdict to the exact substantive SHA-256 of the audited artifact
             audited_ref = str(meta.get("artefacto_auditado") or "").strip()
             if audited_ref:
+                bare_audited = extract_wikilink_id(audited_ref)
+                if self.ctx.assigned_qa_target and bare_audited != extract_wikilink_id(self.ctx.assigned_qa_target):
+                    raise PermissionDeniedError(
+                        f"Violación de QA: se asignó auditar {self.ctx.assigned_qa_target!r}, "
+                        f"pero el veredicto intenta auditar {audited_ref!r}."
+                    )
                 audited_path = resolve_artifact_by_id(self.paths, self.ctx.engagement_id, audited_ref)
+                if self.ctx.blind_qa_allowlist and audited_path not in self.ctx.blind_qa_allowlist:
+                    raise PermissionDeniedError(
+                        f"Violación de QA Ciego: el artefacto {audited_path.name!r} no pertenece a la lista autorizada."
+                    )
+                # Rule P3: Cryptographically bind the QA verdict to the exact substantive SHA-256 of the audited artifact
                 meta["sha256_artefacto_auditado"] = compute_finding_substantive_sha256(audited_path)
 
         if resolved.suffix.lower() == ".json":
@@ -922,42 +1111,51 @@ class ExecutionGuard:
 
     @staticmethod
     def _build_audit_hook_harness(mode: str = "script") -> str:
-        """Build in-process Python audit-hook guardrail blocking out-of-scope writes, process spawns, and network."""
+        """Build in-process Python audit-hook guardrail blocking out-of-scope writes, FFI ctypes, process spawns, and network."""
         if mode == "script":
-            pre_import_stmt = "import ctypes\nif hasattr(ctypes, 'windll'):\n    _ = ctypes.windll.kernel32\n"
+            pre_import_stmt = ""
             runner_stmt = "runpy.run_path(target_entry, run_name='__main__')\n"
         else:
-            pre_import_stmt = (
-                "import ctypes\n"
-                "if hasattr(ctypes, 'windll'):\n"
-                "    _ = ctypes.windll.kernel32\n"
-                "__import__(target_entry)\n"
-            )
+            pre_import_stmt = "__import__(target_entry)\n"
             runner_stmt = "runpy.run_module(target_entry, run_name='__main__', alter_sys=True)\n"
         return (
-            "import os, pathlib, runpy, sys\n"
+            "import os, pathlib, runpy, sys, types\n"
             "allowed_write = [pathlib.Path(p).resolve() for p in sys.argv[1].split(os.pathsep) if p]\n"
             "ws_root = pathlib.Path(sys.argv[2]).resolve()\n"
             "allowed_read = [pathlib.Path(p).resolve() for p in sys.argv[3].split(os.pathsep) if p]\n"
             "target_entry = sys.argv[4]\n"
             "sys.argv = [target_entry] + sys.argv[5:]\n"
             + pre_import_stmt
-            + "_FORBIDDEN_EXACT = frozenset({\n"
+            + "for _mname in ('ctypes', '_ctypes'):\n"
+            "    _mod = sys.modules.get(_mname)\n"
+            "    if _mod is not None:\n"
+            "        for _attr in ('windll', 'cdll', 'pythonapi', 'oledll', 'CDLL', 'WinDLL', 'PyDLL', 'CFUNCTYPE', 'WINFUNCTYPE'):\n"
+            "            try:\n"
+            "                delattr(_mod, _attr)\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "class _CtypesBlocker(types.ModuleType):\n"
+            "    def __getattr__(self, name):\n"
+            "        if name in ('__path__', '__all__'):\n"
+            "            return []\n"
+            "        if name in ('__spec__', '__loader__', '__file__', '__cached__', '__package__'):\n"
+            "            return None\n"
+            "        raise AttributeError(f'M37 Sandbox: acceso FFI ctypes.{name} bloqueado')\n"
+            "sys.modules['ctypes'] = _CtypesBlocker('ctypes')\n"
+            "sys.modules['_ctypes'] = _CtypesBlocker('_ctypes')\n"
+            "_FORBIDDEN_EXACT = frozenset({\n"
             "    'subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.posix_spawnp',\n"
             "    'os.spawn', 'os.exec', 'os.fork', 'os.forkpty', 'os.kill',\n"
             "    'socket.connect', 'socket.bind', 'socket.sendto', 'socket.sendmsg',\n"
             "    'urllib.Request',\n"
+            "    'ctypes.dlopen', 'ctypes.dlsym', 'ctypes.dlsym/handle', 'ctypes.call_function', 'ctypes.cdata',\n"
             "})\n"
-            "_FORBIDDEN_PREFIXES = ('subprocess.', 'os.posix_spawn', 'os.spawn', 'os.exec', 'socket.', 'ftplib.', 'smtplib.', 'telnetlib.', 'webbrowser.')\n"
+            "_FORBIDDEN_PREFIXES = ('subprocess.', 'os.posix_spawn', 'os.spawn', 'os.exec', 'socket.', 'ctypes.', 'ftplib.', 'smtplib.', 'telnetlib.', 'webbrowser.')\n"
             "def _within(p, roots):\n"
             "    return any(p == r or r in p.parents for r in roots)\n"
             "def _hook(event, args):\n"
             "    if event in _FORBIDDEN_EXACT or event.startswith(_FORBIDDEN_PREFIXES):\n"
             "        raise PermissionError(f'M37 Sandbox: evento prohibido {event}')\n"
-            "    if event == 'ctypes.dlopen':\n"
-            "        lib_arg = str(args[0] or '').lower()\n"
-            "        if not lib_arg or any(tok in lib_arg for tok in ('msvcrt', 'ucrt', 'libc', 'libsystem', '.so', '.dylib', '/', '\\\\')):\n"
-            "            raise PermissionError(f'M37 Sandbox: evento prohibido ctypes.dlopen ({args[0]})')\n"
             "    if event == 'open':\n"
             "        path_arg, mode_arg, flags = args[0], args[1], args[2]\n"
             "        if isinstance(path_arg, (str, bytes, os.PathLike)):\n"
@@ -967,23 +1165,23 @@ class ExecutionGuard:
             "                return\n"
             "            p = pathlib.Path(raw_str).resolve()\n"
             "            if p.name == '.env' or p.name.startswith('.env.'):\n"
-            "                raise PermissionError(f'M37 Sandbox: lectura/escritura de .env bloqueada ({p})')\n"
+            "                raise PermissionError(f'M37 Sandbox: lectura/escritura de .env bloqueada')\n"
             "            is_write = (bool(mode_arg) and any(c in mode_arg for c in ('w', 'a', 'x', '+'))) or bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC))\n"
             "            if is_write and not _within(p, allowed_write):\n"
-            "                raise PermissionError(f'M37 Sandbox: escritura fuera de perimetro bloqueada ({p})')\n"
+            "                raise PermissionError(f'M37 Sandbox: escritura fuera de perimetro bloqueada ({p.name})')\n"
             "            if not is_write and (p == ws_root or ws_root in p.parents) and not _within(p, allowed_read):\n"
-            "                raise PermissionError(f'M37 Sandbox: lectura fuera de encargo bloqueada ({p})')\n"
+            "                raise PermissionError(f'M37 Sandbox: lectura fuera de encargo bloqueada ({p.name})')\n"
             "    elif event in ('os.remove', 'os.unlink', 'os.rmdir', 'os.mkdir', 'os.truncate', 'os.chmod', 'os.chown'):\n"
             "        if isinstance(args[0], (str, bytes, os.PathLike)):\n"
             "            p = pathlib.Path(os.fsdecode(args[0])).resolve()\n"
             "            if not _within(p, allowed_write):\n"
-            "                raise PermissionError(f'M37 Sandbox: mutacion fuera de perimetro bloqueada ({p})')\n"
+            "                raise PermissionError(f'M37 Sandbox: mutacion fuera de perimetro bloqueada ({p.name})')\n"
             "    elif event in ('os.rename', 'os.replace', 'os.link', 'os.symlink', 'shutil.copyfile', 'shutil.move', 'shutil.rmtree'):\n"
             "        for raw_p in args[:2]:\n"
             "            if isinstance(raw_p, (str, bytes, os.PathLike)):\n"
             "                p = pathlib.Path(os.fsdecode(raw_p)).resolve()\n"
             "                if not _within(p, allowed_write):\n"
-            "                    raise PermissionError(f'M37 Sandbox: mutacion fuera de perimetro bloqueada ({p})')\n"
+            "                    raise PermissionError(f'M37 Sandbox: mutacion fuera de perimetro bloqueada ({p.name})')\n"
             "sys.addaudithook(_hook)\n"
             + runner_stmt
         )
@@ -991,6 +1189,10 @@ class ExecutionGuard:
     def run_verification_cmd(self, cmd: list[str] | str, timeout_s: int = 60) -> dict[str, Any]:
         """Run pytest/ruff/mypy/unittest inside codigo/<encargo>/ with audit-hook + snapshot rollback protection (P7)."""
         self._require_tool_permission("run_verification_cmd")
+        if not self.ctx.allow_compute:
+            raise PermissionDeniedError(
+                f"El nodo {self.ctx.node_id!r} tiene requiere_computo=False; ejecución de comandos deshabilitada."
+            )
         code_root = (self.paths.codigo_root / self.ctx.engagement_id).resolve()
         code_root.mkdir(parents=True, exist_ok=True)
 
@@ -1023,9 +1225,30 @@ class ExecutionGuard:
                 f"Herramienta de verificación no autorizada: {tokens[0]!r}. Permitidas: {sorted(ALLOWED_VERIFY_TOOLS)}"
             )
 
+        forbidden_verify_flags = {
+            "--collect-only",
+            "--co",
+            "--setup-only",
+            "--setup-plan",
+            "--version",
+            "-V",
+            "-h",
+            "--help",
+        }
+        for arg in tool_args:
+            arg_head = arg.split("=", 1)[0].strip()
+            if arg_head in forbidden_verify_flags:
+                raise PermissionDeniedError(
+                    f"Flag prohibida en run_verification_cmd ({arg!r}): las pruebas deben ejecutarse realmente."
+                )
+
         import tempfile
 
         sbx_tmp = Path(tempfile.mkdtemp(prefix="m37_verify_tmp_")).resolve()
+        allowed_write_roots = (code_root,)
+        snapshot = self._capture_protected_snapshot(allowed_write_roots)
+        proc: subprocess.CompletedProcess[str] | None = None
+        timed_out_exc: subprocess.TimeoutExpired | None = None
         try:
             scrubbed_env = _build_scrubbed_subprocess_env(self.ctx.base_env)
             scrubbed_env["TMP"] = str(sbx_tmp)
@@ -1038,7 +1261,6 @@ class ExecutionGuard:
                 extra_paths.append(existing_py_path)
             scrubbed_env["PYTHONPATH"] = os.pathsep.join(extra_paths)
 
-            allowed_write_roots = (code_root,)
             allowed_read_roots = [
                 code_root,
                 sbx_tmp,
@@ -1046,40 +1268,50 @@ class ExecutionGuard:
                 (self.paths.vault_root / "40_Metodos").resolve(),
                 self.paths.engagement_dir(self.ctx.engagement_id).resolve(),
             ]
-            snapshot = self._capture_protected_snapshot(allowed_write_roots)
 
-            if tool_mod in ("pytest", "unittest", "py_compile"):
-                effective_tool_args = list(tool_args)
-                if tool_mod == "pytest" and not any(a.startswith("--rootdir") for a in effective_tool_args):
+            effective_tool_args = list(tool_args)
+            if tool_mod == "pytest":
+                if not any(a.startswith("--rootdir") for a in effective_tool_args):
                     effective_tool_args = [f"--rootdir={code_root}", *effective_tool_args]
-                harness_code = self._build_audit_hook_harness(mode="module")
-                exec_argv = [
-                    sys.executable,
-                    "-c",
-                    harness_code,
-                    os.pathsep.join(str(p) for p in (*allowed_write_roots, sbx_tmp)),
-                    str(self.paths.workspace_root.resolve()),
-                    os.pathsep.join(str(p) for p in allowed_read_roots),
-                    tool_mod,
-                    *effective_tool_args,
-                ]
-            else:
-                exec_argv = [sys.executable, "-m", tool_mod, *tool_args]
+                if not any(a.startswith("--color") for a in effective_tool_args):
+                    effective_tool_args = ["--color=no", *effective_tool_args]
 
-            proc = subprocess.run(
-                exec_argv,
-                cwd=code_root,
-                env=scrubbed_env,
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=min(max(timeout_s, 1), 60),
-                check=False,
-            )
+            harness_code = self._build_audit_hook_harness(mode="module")
+            exec_argv = [
+                sys.executable,
+                "-c",
+                harness_code,
+                os.pathsep.join(str(p) for p in (*allowed_write_roots, sbx_tmp)),
+                str(self.paths.workspace_root.resolve()),
+                os.pathsep.join(str(p) for p in allowed_read_roots),
+                tool_mod,
+                *effective_tool_args,
+            ]
+
+            try:
+                proc = subprocess.run(
+                    exec_argv,
+                    cwd=code_root,
+                    env=scrubbed_env,
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(max(timeout_s, 1), 60),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                timed_out_exc = exc
         finally:
             shutil.rmtree(sbx_tmp, ignore_errors=True)
+            tampered = self._verify_and_restore_snapshot(snapshot, allowed_write_roots)
 
-        tampered = self._verify_and_restore_snapshot(snapshot, allowed_write_roots)
+        if timed_out_exc is not None:
+            (code_root / RECEIPT_FILENAME).unlink(missing_ok=True)
+            raise PermissionDeniedError(
+                f"Timeout en run_verification_cmd ({canonical_cmd}); snapshot verificado/revertido (tampered={tampered})."
+            ) from timed_out_exc
+
+        assert proc is not None
         if tampered or "M37 Sandbox:" in proc.stderr or "M37 Sandbox:" in proc.stdout:
             (code_root / RECEIPT_FILENAME).unlink(missing_ok=True)
             raise PermissionDeniedError(
@@ -1089,21 +1321,34 @@ class ExecutionGuard:
                 "Cambios revertidos y recibo denegado."
             )
 
+        effective_exit = proc.returncode
+        combined_out = f"{proc.stdout}\n{proc.stderr}"
+        if tool_mod == "pytest" and effective_exit == 0:
+            if not re.search(r"\b[1-9]\d*\s+passed\b", combined_out):
+                effective_exit = 5
+        elif tool_mod == "unittest" and effective_exit == 0:
+            m_ran = re.search(r"Ran\s+(\d+)\s+test", combined_out)
+            if not m_ran or int(m_ran.group(1)) < 1:
+                effective_exit = 5
+
         tree_sha256 = compute_code_tree_sha256(code_root)
         receipt = {
             "encargo": self.ctx.engagement_id,
             "nodo": self.ctx.node_id,
             "command": canonical_cmd,
-            "exit_code": proc.returncode,
+            "tool": tool_mod,
+            "exit_code": effective_exit,
             "tree_sha256": tree_sha256,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "stdout_tail": proc.stdout[-4000:],
             "stderr_tail": proc.stderr[-4000:],
         }
-        write_utf8_lf(
-            code_root / RECEIPT_FILENAME,
-            json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
-        )
+        # Only actual test runners (pytest/unittest) can emit or update the TDD verification receipt
+        if tool_mod in ("pytest", "unittest"):
+            write_utf8_lf(
+                code_root / RECEIPT_FILENAME,
+                json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+            )
         return receipt
 
     # ------------------------------------------------------------------
@@ -1111,6 +1356,10 @@ class ExecutionGuard:
     # ------------------------------------------------------------------
     def write_sandbox_script(self, script_rel_path: str | Path, content: str) -> str:
         self._require_tool_permission("write_sandbox_script")
+        if not self.ctx.allow_compute:
+            raise PermissionDeniedError(
+                f"El nodo {self.ctx.node_id!r} tiene requiere_computo=False; no se permite crear scripts analíticos."
+            )
         analisis_enc = (self.paths.analisis_root / self.ctx.engagement_id).resolve()
         raw = Path(script_rel_path)
         if raw.is_absolute():
@@ -1130,14 +1379,17 @@ class ExecutionGuard:
         write_utf8_lf(resolved, content)
         return resolved.relative_to(self.paths.workspace_root.resolve()).as_posix()
 
-    def run_sandbox_script(
+    def _run_sandbox_script_internal(
         self,
         script_path: str | Path,
         args: list[str] | None = None,
         timeout_s: int = 60,
     ) -> dict[str, Any]:
-        """Execute a script in analisis/<encargo>/ protected by process audit-hook guardrail + lossless snapshot check."""
-        self._require_tool_permission("run_sandbox_script")
+        """Internal runner for analytical scripts in analisis/<encargo>/ with audit-hook + timeout-safe rollback."""
+        if not self.ctx.allow_compute:
+            raise PermissionDeniedError(
+                f"El nodo {self.ctx.node_id!r} tiene requiere_computo=False; no se permite ejecutar scripts analíticos."
+            )
         analisis_enc = (self.paths.analisis_root / self.ctx.engagement_id).resolve()
         procesados_enc = (self.paths.datos_root / self.ctx.engagement_id / "procesados").resolve()
         datos_enc = (self.paths.datos_root / self.ctx.engagement_id).resolve()
@@ -1155,18 +1407,18 @@ class ExecutionGuard:
         if analisis_enc not in resolved_script.parents or not resolved_script.is_file():
             raise PermissionDeniedError(
                 f"run_sandbox_script solo ejecuta scripts existentes dentro de analisis/{self.ctx.engagement_id}/ "
-                f"(recibido: {script_path!r})."
+                f"(recibido: { str(script_path)!r})."
             )
 
         import tempfile
 
         sbx_tmp = Path(tempfile.mkdtemp(prefix="m37_sbx_tmp_")).resolve()
+        allowed_write_roots = (analisis_enc, procesados_enc)
+        snapshot = self._capture_protected_snapshot(allowed_write_roots)
+        proc: subprocess.CompletedProcess[str] | None = None
+        timed_out_exc: subprocess.TimeoutExpired | None = None
         try:
-            # Pre-execution snapshot of ALL protected files (no 2MB truncation — fixes P5 data loss bug)
-            allowed_write_roots = (analisis_enc, procesados_enc)
-            snapshot = self._capture_protected_snapshot(allowed_write_roots)
             harness_code = self._build_audit_hook_harness(mode="script")
-
             allowed_read_roots = [
                 analisis_enc,
                 datos_enc,
@@ -1180,31 +1432,39 @@ class ExecutionGuard:
             scrubbed_env["TMP"] = str(sbx_tmp)
             scrubbed_env["TEMP"] = str(sbx_tmp)
             scrubbed_env["TMPDIR"] = str(sbx_tmp)
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    harness_code,
-                    os.pathsep.join(str(p) for p in (*allowed_write_roots, sbx_tmp)),
-                    str(self.paths.workspace_root.resolve()),
-                    os.pathsep.join(str(p) for p in allowed_read_roots),
-                    str(resolved_script),
-                    *(args or []),
-                ],
-                cwd=analisis_enc,
-                env=scrubbed_env,
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=min(max(timeout_s, 1), 60),
-                check=False,
-            )
+            try:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        harness_code,
+                        os.pathsep.join(str(p) for p in (*allowed_write_roots, sbx_tmp)),
+                        str(self.paths.workspace_root.resolve()),
+                        os.pathsep.join(str(p) for p in allowed_read_roots),
+                        str(resolved_script),
+                        *(args or []),
+                    ],
+                    cwd=analisis_enc,
+                    env=scrubbed_env,
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(max(timeout_s, 1), 60),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                timed_out_exc = exc
         finally:
             shutil.rmtree(sbx_tmp, ignore_errors=True)
+            tampered = self._verify_and_restore_snapshot(snapshot, allowed_write_roots)
 
-        # Post-execution snapshot check & rollback if anything outside allowed_write_roots changed
-        tampered = self._verify_and_restore_snapshot(snapshot, allowed_write_roots)
-        if tampered or "M37 Sandbox:" in proc.stderr:
+        if timed_out_exc is not None:
+            raise PermissionDeniedError(
+                f"Timeout en run_sandbox_script ({resolved_script.name}); snapshot verificado/revertido (tampered={tampered})."
+            ) from timed_out_exc
+
+        assert proc is not None
+        if tampered or "M37 Sandbox:" in proc.stderr or "M37 Sandbox:" in proc.stdout:
             raise PermissionDeniedError(
                 f"Violación de guardarraíl en run_sandbox_script ({resolved_script.name}): "
                 f"{proc.stderr.strip() or 'Mutación detectada y revertida fuera de analisis/<encargo>/.'}"
@@ -1218,10 +1478,21 @@ class ExecutionGuard:
             "stderr": proc.stderr[-4000:],
         }
 
+    def run_sandbox_script(
+        self,
+        script_path: str | Path,
+        args: list[str] | None = None,
+        timeout_s: int = 60,
+    ) -> dict[str, Any]:
+        """Execute a script in analisis/<encargo>/ protected by process audit-hook guardrail + lossless snapshot check."""
+        self._require_tool_permission("run_sandbox_script")
+        return self._run_sandbox_script_internal(script_path, args=args, timeout_s=timeout_s)
+
     def _capture_protected_snapshot(self, allowed_write_roots: tuple[Path, ...]) -> dict[Path, _FileSnapshotEntry]:
-        """Record metadata (size, mtime_ns, sha256) of ALL protected files regardless of size (fixes P5)."""
+        """Record metadata (size, mtime_ns, sha256) of ALL protected files; keep inline_bytes only for small config/notes."""
         snap: dict[Path, _FileSnapshotEntry] = {}
         ws_root = self.paths.workspace_root.resolve()
+        datos_root = self.paths.datos_root.resolve()
         if not ws_root.exists():
             return snap
         for fpath in ws_root.rglob("*"):
@@ -1233,7 +1504,8 @@ class ExecutionGuard:
             if any(part in EXCLUDED_CODE_DIRS for part in res.parts):
                 continue
             st = res.stat()
-            inline = res.read_bytes() if st.st_size <= 2_000_000 else None
+            in_datos = res == datos_root or datos_root in res.parents
+            inline = res.read_bytes() if (not in_datos and st.st_size <= 512_000) else None
             digest = sha256_bytes(inline) if inline is not None else sha256_file(res)
             snap[res] = _FileSnapshotEntry(
                 size=st.st_size,
@@ -1291,15 +1563,21 @@ class ExecutionGuard:
     # Clean Web Fetch (perfil_herramientas == 'documental')
     # ------------------------------------------------------------------
     def web_fetch_clean(self, url: str, timeout_s: int = 20) -> str:
-        """Fetch public HTTP(S) text cleanly without cookies/credentials and wrap in breakout-proof fence."""
+        """Fetch public HTTP(S) text cleanly with SSRF protection, persist snapshot in referencias/, and wrap in fence."""
         self._require_tool_permission("web_fetch_clean")
-        if not url.startswith(("https://", "http://")):
-            raise ValueError("web_fetch_clean solo acepta URLs http:// o https://.")
+        _validate_public_http_url(url)
+
+        class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+                _validate_public_http_url(newurl)
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        opener = urllib.request.build_opener(_SafeRedirectHandler())
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "M37-CleanFetch/0.2 (+https://move37.local)"},
         )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+        with opener.open(req, timeout=timeout_s) as resp:
             raw_html = resp.read(1_500_000).decode("utf-8", errors="replace")
 
         try:
@@ -1312,4 +1590,12 @@ class ExecutionGuard:
             extracted = re.sub(r"<[^>]+>", " ", no_scripts)
             extracted = re.sub(r"\s+", " ", extracted).strip()
 
-        return sanitize_untrusted_payload(extracted[:50_000], source_id=url)
+        clean_slice = extracted[:50_000]
+        snap_hash = sha256_bytes(clean_slice.encode("utf-8"))
+        snap_rel = f"referencias/{self.ctx.engagement_id}/web_{snap_hash[:12]}.txt"
+        snap_abs = (self.paths.workspace_root / snap_rel).resolve()
+        write_utf8_lf(snap_abs, clean_slice + "\n")
+
+        header_meta = f"[SNAPSHOT_LOCAL: {snap_rel} | HASH_SNAPSHOT: sha256:{snap_hash}]\n"
+        return sanitize_untrusted_payload(header_meta + clean_slice, source_id=url)
+

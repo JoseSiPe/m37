@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import date
@@ -10,7 +11,34 @@ from typing import Any, Literal
 
 import frontmatter
 import yaml
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+SAFE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+class StrictContractModel(BaseModel):
+    """Base contract model enforcing fail-closed rejection of undeclared fields (prevents plugin/metadata smuggling)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _normalize_and_validate_method_slug(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    match = re.match(r"^\[\[([^\]#|]+)(?:[#|][^\]]*)?\]\]$", cleaned)
+    if match:
+        cleaned = match.group(1).strip()
+    if cleaned.endswith(".md"):
+        cleaned = cleaned[:-3]
+    if not SAFE_SLUG_RE.fullmatch(cleaned):
+        raise ValueError(
+            f"Identificador de método inválido ({raw!r}): solo se permiten slugs canónicos '^[a-z0-9][a-z0-9_-]*$' sin rutas ni '..'."
+        )
+    return cleaned
+
 
 RigorLevel = Literal["L1", "L2", "L3", "L4"]
 ToolProfile = Literal["documental", "analitico", "construccion", "editorial", "qa_ciego"]
@@ -58,7 +86,7 @@ class ContractValidationError(ValueError):
 
 
 # 1. CONTRATO DE BRIEF (20_Encargos/<ID>/00_Brief.md)
-class BriefContract(BaseModel):
+class BriefContract(StrictContractModel):
     tipo: Literal["brief"] = "brief"
     id_encargo: str
     cliente: str
@@ -74,6 +102,9 @@ class BriefContract(BaseModel):
     dominios_bloqueantes: list[str] = Field(default_factory=list)
     hipotesis_a_falsear: list[str] = Field(default_factory=list)
     puerta_1_aprobada: bool = False
+    puerta_1_sha256: str | None = None
+    puerta_1_aprobado_por: str | None = None
+    puerta_1_fecha_utc: str | None = None
 
     @model_validator(mode="after")
     def exigir_hipotesis_en_rigor_medio_alto(self) -> BriefContract:
@@ -95,7 +126,7 @@ CognitiveAxis = Literal[
 ArtifactKind = Literal["evidencia", "derivacion", "hallazgo", "entregable", "codigo"]
 
 
-class ModelRoutingSpec(BaseModel):
+class ModelRoutingSpec(StrictContractModel):
     eje_dominante: CognitiveAxis
     contexto_estimado_tokens: int = Field(gt=0)
     modelo_ejecutor: str
@@ -106,7 +137,7 @@ class ModelRoutingSpec(BaseModel):
     max_turns: int = Field(ge=1, le=40, default=14)
 
 
-class PlanContract(BaseModel):
+class PlanContract(StrictContractModel):
     tipo: Literal["plan"] = "plan"
     id_plan: str
     version: int = Field(ge=1, default=1)
@@ -116,6 +147,9 @@ class PlanContract(BaseModel):
     nodos: list[str] = Field(min_length=1)
     presupuesto_total_estimado_usd: float = Field(ge=0.0)
     puerta_2_aprobada: bool = False
+    puerta_2_sha256: str | None = None
+    puerta_2_aprobado_por: str | None = None
+    puerta_2_fecha_utc: str | None = None
 
     @model_validator(mode="after")
     def exigir_motivo_si_v2(self) -> PlanContract:
@@ -124,7 +158,7 @@ class PlanContract(BaseModel):
         return self
 
 
-class NodeContract(BaseModel):
+class NodeContract(StrictContractModel):
     id: str = Field(pattern=r"^N-\d{2,3}$")
     tipo: Literal["nodo"] = "nodo"
     encargo: str
@@ -146,9 +180,14 @@ class NodeContract(BaseModel):
     rondas_qa: int = Field(ge=0, le=2, default=0)
     enrutamiento_modelo: ModelRoutingSpec
 
+    @field_validator("metodo")
+    @classmethod
+    def _validar_metodo_nodo(cls, v: str | None) -> str | None:
+        return _normalize_and_validate_method_slug(v)
+
 
 # 2-bis. CONTRATO DE ARQUETIPO DECLARATIVO (00_Sistema/Arquetipos/ARQ_*.md, frontmatter YAML)
-class ArchetypeNodeSpec(BaseModel):
+class ArchetypeNodeSpec(StrictContractModel):
     """Plantilla de un nodo del DAG. Toda semántica de disciplina vive aquí (plugin), nunca en src/m37/."""
 
     id: str = Field(pattern=r"^N-\d{2,3}$")
@@ -167,8 +206,13 @@ class ArchetypeNodeSpec(BaseModel):
     presupuesto_max_usd: float = Field(gt=0.0, le=50.0, default=0.75)
     max_turns: int = Field(ge=1, le=40, default=14)
 
+    @field_validator("metodo")
+    @classmethod
+    def _validar_metodo_arq(cls, v: str | None) -> str | None:
+        return _normalize_and_validate_method_slug(v)
 
-class ArchetypeContract(BaseModel):
+
+class ArchetypeContract(StrictContractModel):
     tipo: Literal["arquetipo"] = "arquetipo"
     id_arquetipo: str
     descripcion: str = ""
@@ -198,7 +242,7 @@ def validate_dag_topological_order(nodes: list[tuple[str, list[str]]]) -> None:
 
 
 # 3. CONTRATO DE EVIDENCIA (30_Evidencia_Publica/E-*.md o Evidencia_Interna/EI-*.md)
-class EvidenceContract(BaseModel):
+class EvidenceContract(StrictContractModel):
     id: str
     tipo: Literal["evidencia"] = "evidencia"
     visibilidad: Literal["publica", "interna_encargo"]
@@ -250,12 +294,12 @@ def _contains_numeric_value(val: Any) -> bool:
 
 
 # 4. CONTRATO DE DERIVACIÓN OPCIONAL (Derivaciones/D-XX.json o .md)
-class InputHashRef(BaseModel):
+class InputHashRef(StrictContractModel):
     id_o_ruta: str
     sha256: str
 
 
-class DerivationContract(BaseModel):
+class DerivationContract(StrictContractModel):
     id: str
     tipo: Literal["derivacion"] = "derivacion"
     encargo: str
@@ -268,6 +312,14 @@ class DerivationContract(BaseModel):
     metadatos_metodo: dict[str, Any] = Field(default_factory=dict)
     invalidada: bool = False
     motivo_invalidacion: str | None = None
+
+    @field_validator("metodo")
+    @classmethod
+    def _validar_metodo_deriv(cls, v: str) -> str:
+        res = _normalize_and_validate_method_slug(v)
+        if not res:
+            raise ValueError("El campo 'metodo' no puede estar vacío.")
+        return res
 
     @model_validator(mode="after")
     def exigir_motivo_si_derivacion_invalidada(self) -> DerivationContract:
@@ -282,7 +334,7 @@ class DerivationContract(BaseModel):
 
 
 # 5. CONTRATO UNIVERSAL DE HALLAZGO (Hallazgos/H-*.md)
-class FindingContract(BaseModel):
+class FindingContract(StrictContractModel):
     id: str
     tipo: Literal["hallazgo"] = "hallazgo"
     encargo: str
@@ -308,6 +360,14 @@ class FindingContract(BaseModel):
     que_lo_refutaria: str = Field(min_length=10)
     promovible_a_capital: bool = False
 
+    @field_validator("metodo")
+    @classmethod
+    def _validar_metodo_hallazgo(cls, v: str) -> str:
+        res = _normalize_and_validate_method_slug(v)
+        if not res:
+            raise ValueError("El campo 'metodo' no puede estar vacío.")
+        return res
+
     @model_validator(mode="after")
     def exigir_al_menos_un_sustento(self) -> FindingContract:
         if len(self.sustento_evidencia) + len(self.sustento_derivaciones) < 1:
@@ -318,7 +378,7 @@ class FindingContract(BaseModel):
 
 
 # 6. CONTRATO DE VEREDICTO DE QA (QA/V-*.md)
-class QAIssue(BaseModel):
+class QAIssue(StrictContractModel):
     id_defecto: str = Field(pattern=r"^DEF-\d{2}$")
     severidad: Literal["bloqueante", "mayor", "menor", "sugerencia"]
     categoria: Literal[
@@ -337,7 +397,7 @@ class QAIssue(BaseModel):
     remediacion: str
 
 
-class QAVerdictContract(BaseModel):
+class QAVerdictContract(StrictContractModel):
     id: str
     tipo: Literal["veredicto_qa"] = "veredicto_qa"
     encargo: str
@@ -397,6 +457,7 @@ REQUIRED_MARKDOWN_HEADINGS: dict[str, list[str]] = {
         "## Condiciones de validez y límites",
     ],
 }
+REQUIRED_HEADINGS = REQUIRED_MARKDOWN_HEADINGS
 
 
 def extract_wikilink_id(raw_ref: str) -> str:
@@ -497,4 +558,71 @@ def compute_finding_substantive_sha256(content_or_path: str | Path) -> str:
     canonical_meta = {k: v for k, v in meta.items() if k != "estado_qa"}
     canonical = dump_markdown_note(canonical_meta, body).replace("\r\n", "\n")
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_brief_substantive_sha256(
+    content_or_path_or_meta: str | Path | dict[str, Any],
+    body: str | None = None,
+) -> str:
+    """Compute SHA-256 of 00_Brief.md substantive content (excluding puerta_1_* governance fields)."""
+    if isinstance(content_or_path_or_meta, dict):
+        meta = content_or_path_or_meta
+        body_str = body or ""
+    else:
+        raw_text = (
+            content_or_path_or_meta.read_text(encoding="utf-8")
+            if isinstance(content_or_path_or_meta, Path)
+            else content_or_path_or_meta
+        )
+        meta, body_str = parse_raw_artifact(raw_text, suffix=".md")
+    excluded = {"puerta_1_aprobada", "puerta_1_sha256", "puerta_1_aprobado_por", "puerta_1_fecha_utc"}
+    canonical_meta = {k: v for k, v in meta.items() if k not in excluded}
+    canonical = dump_markdown_note(canonical_meta, body_str).replace("\r\n", "\n")
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_plan_dag_sha256(
+    engagement_dir_or_meta: Path | dict[str, Any],
+    body: str | None = None,
+    node_paths: list[Path] | None = None,
+) -> str:
+    """Compute SHA-256 over 01_Plan.md + all Nodos/N-*.md substantive definitions (excluding runtime state/rondas_qa)."""
+    if isinstance(engagement_dir_or_meta, dict):
+        p_meta = engagement_dir_or_meta
+        p_body = body or ""
+        npaths = list(node_paths or [])
+    else:
+        plan_path = (
+            engagement_dir_or_meta
+            if engagement_dir_or_meta.is_file()
+            else engagement_dir_or_meta / "01_Plan.md"
+        )
+        if not plan_path.is_file():
+            return hashlib.sha256(b"").hexdigest()
+        p_meta, p_body = parse_raw_artifact(plan_path.read_text(encoding="utf-8"), suffix=".md")
+        nodos_dir = plan_path.parent / "Nodos"
+        npaths = [
+            nodos_dir / f"{extract_wikilink_id(str(raw_nid))}.md"
+            for raw_nid in (p_meta.get("nodos") or [])
+        ]
+
+    excluded_plan = {"puerta_2_aprobada", "puerta_2_sha256", "puerta_2_aprobado_por", "puerta_2_fecha_utc"}
+    canon_plan = dump_markdown_note({k: v for k, v in p_meta.items() if k not in excluded_plan}, p_body).replace(
+        "\r\n", "\n"
+    )
+    chunks: list[str] = [f"PLAN:{canon_plan}"]
+
+    for npath in npaths:
+        bare_nid = npath.stem
+        if not npath.is_file():
+            chunks.append(f"NODE:{bare_nid}:MISSING")
+            continue
+        n_meta, n_body = parse_raw_artifact(npath.read_text(encoding="utf-8"), suffix=".md")
+        excluded_node = {"estado", "rondas_qa", "enrutamiento_modelo", "depende_de"}
+        canon_node = dump_markdown_note({k: v for k, v in n_meta.items() if k not in excluded_node}, n_body).replace(
+            "\r\n", "\n"
+        )
+        chunks.append(f"NODE:{bare_nid}:{canon_node}")
+
+    return hashlib.sha256("\n===M37_DAG===\n".join(chunks).encode("utf-8")).hexdigest()
 

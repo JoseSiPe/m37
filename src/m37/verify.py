@@ -26,6 +26,7 @@ from m37.guards import (
 )
 from m37.schemas import (
     EPISTEMIC_RANK,
+    SAFE_SLUG_RE,
     ContractValidationError,
     DerivationContract,
     EvidenceContract,
@@ -41,6 +42,7 @@ from m37.schemas import (
 
 RF_ID_RE = re.compile(r"\bRF-\d{2,3}\b")
 PY_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
+ALLOWED_CORE_VALIDATOR_PLUGINS: frozenset[str] = frozenset({"sdd_codigo"})
 
 
 @dataclass
@@ -120,6 +122,21 @@ def verify_sdd_code_derivation(
             f"La suite de tests falló en el recibo del microkernel (exit_code={receipt.get('exit_code')!r} != 0)."
         )
 
+    cmd_str = str(receipt.get("command") or "").strip()
+    cmd_tokens = cmd_str.split()
+    is_real_test_runner = any(tok in ("pytest", "unittest") for tok in cmd_tokens[:3])
+    forbidden_flags = {"--collect-only", "--co", "--setup-only", "--setup-plan", "--version", "-V", "-h", "--help"}
+    has_noop_flag = any(tok.split("=", 1)[0] in forbidden_flags for tok in cmd_tokens)
+    if not is_real_test_runner or has_noop_flag:
+        errors.append(
+            f"El recibo {RECEIPT_FILENAME} no proviene de una corrida real de pytest o unittest (command={cmd_str!r})."
+        )
+    else:
+        combined_out = f"{receipt.get('stdout_tail', '')}\n{receipt.get('stderr_tail', '')}"
+        if "pytest" in cmd_tokens[:3] and combined_out.strip():
+            if "no tests ran" in combined_out.lower() or "collected 0 items" in combined_out.lower():
+                errors.append("El recibo de pytest indica que no se ejecutó ninguna prueba ('no tests ran').")
+
     live_tree_sha256 = compute_code_tree_sha256(code_dir)
     if receipt.get("tree_sha256") != live_tree_sha256:
         errors.append(
@@ -194,36 +211,48 @@ def _load_and_run_method_validator_plugin(
     metodo_id: str,
     deriv: DerivationContract,
 ) -> list[str]:
-    """Load optional validador_plugin declared in 40_Metodos/<metodo>.md frontmatter."""
+    """Load optional validador_plugin declared in 40_Metodos/<metodo>.md frontmatter from core repo allowlist ONLY."""
     bare_metodo = extract_wikilink_id(metodo_id)
-    metodo_note = paths.vault_root / "40_Metodos" / f"{bare_metodo}.md"
-    if not metodo_note.is_file():
-        return []
-    try:
-        meta, _ = parse_raw_artifact(metodo_note.read_text(encoding="utf-8"), suffix=".md")
-    except ContractValidationError:
-        return []
+    if not SAFE_SLUG_RE.fullmatch(bare_metodo):
+        return [f"Identificador de método inválido o con path traversal bloqueado: {metodo_id!r}"]
 
-    plugin_name = str(meta.get("validador_plugin") or "").strip()
+    metodos_root = (paths.vault_root / "40_Metodos").resolve()
+    metodo_note = (metodos_root / f"{bare_metodo}.md").resolve()
+    plugin_name = ""
+    if metodo_note.parent == metodos_root and metodo_note.is_file():
+        try:
+            meta, _ = parse_raw_artifact(metodo_note.read_text(encoding="utf-8"), suffix=".md")
+        except ContractValidationError:
+            return []
+        if meta.get("tipo") == "derivacion" or meta.get("tipo") == "hallazgo":
+            return [f"El archivo 40_Metodos/{bare_metodo}.md no es una nota de método válida."]
+        plugin_name = str(meta.get("validador_plugin") or "").strip()
+    elif bare_metodo in ("verificacion-sdd-codigo", "sdd-ears-tdd", "sdd_codigo") or deriv.productor_modo == "verificacion_codigo":
+        plugin_name = "sdd_codigo"
+
     if not plugin_name:
         return []
+
+    if not SAFE_SLUG_RE.fullmatch(plugin_name) or plugin_name not in ALLOWED_CORE_VALIDATOR_PLUGINS:
+        return [
+            f"validador_plugin {plugin_name!r} no está registrado en la lista blanca del motor M37 "
+            f"({sorted(ALLOWED_CORE_VALIDATOR_PLUGINS)})."
+        ]
+
+    # Security Rule (Critical #1): Load validator plugins ONLY from the immutable core engine repo, NEVER from workspace
+    plugin_file = (get_core_repo_root() / "extensions" / "method_validators" / f"{plugin_name}.py").resolve()
+    if plugin_file.is_file():
+        spec = importlib.util.spec_from_file_location(f"m37_validator_{plugin_name}", plugin_file)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            validate_fn = getattr(module, "validate_derivation", None)
+            if callable(validate_fn):
+                return list(validate_fn(paths, engagement_id, deriv))
 
     if plugin_name == "sdd_codigo":
         return verify_sdd_code_derivation(paths, engagement_id, deriv)
 
-    plugin_candidates = [
-        paths.workspace_root / "extensions" / "method_validators" / f"{plugin_name}.py",
-        get_core_repo_root() / "extensions" / "method_validators" / f"{plugin_name}.py",
-    ]
-    for plugin_file in plugin_candidates:
-        if plugin_file.is_file():
-            spec = importlib.util.spec_from_file_location(f"m37_validator_{plugin_name}", plugin_file)
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                validate_fn = getattr(module, "validate_derivation", None)
-                if callable(validate_fn):
-                    return list(validate_fn(paths, engagement_id, deriv))
     return [f"No se encontró el validador_plugin {plugin_name!r} requerido por 40_Metodos/{bare_metodo}.md."]
 
 
@@ -256,7 +285,7 @@ def verify_derivation_phase_a(
     *,
     rerun: bool = False,
 ) -> PhaseAResult:
-    """Mechanical Phase A check for a Derivation artifact (D-*.json or D-*.md), with optional deterministic script --rerun."""
+    """Mechanical Phase A check for a Derivation artifact (D-*.json or D-*.md), with deterministic script execution in L3/L4."""
     if not derivation_path.is_file():
         return PhaseAResult(passed=False, artifact_id=derivation_path.stem, errors=["Archivo de Derivación no existe."])
 
@@ -306,7 +335,7 @@ def verify_derivation_phase_a(
             errors.append(f"La Derivación {validated.id} con productor_modo='script' debe declarar productor_sha256.")
         elif sha256_file(script_file) != validated.productor_sha256:
             errors.append(f"El script {validated.productor_ref!r} cambió respecto a productor_sha256.")
-        elif rerun:
+        elif rerun or rigor in ("L3", "L4"):
             guard = ExecutionGuard(
                 paths,
                 AgentExecutionContext(
@@ -320,14 +349,14 @@ def verify_derivation_phase_a(
                 run_res = guard.run_sandbox_script(script_file)
                 if run_res["exit_code"] != 0:
                     errors.append(
-                        f"Re-ejecución (--rerun) de {validated.productor_ref!r} falló con exit_code={run_res['exit_code']}: "
+                        f"Re-ejecución de {validated.productor_ref!r} falló con exit_code={run_res['exit_code']}: "
                         f"{run_res['stderr']}"
                     )
                 else:
                     recomputed = _extract_json_dict_from_stdout(str(run_res["stdout"]))
                     if recomputed is None:
                         errors.append(
-                            f"Re-ejecución (--rerun) de {validated.productor_ref!r} no emitió un objeto JSON verificable en stdout."
+                            f"Re-ejecución de {validated.productor_ref!r} no emitió un objeto JSON verificable en stdout."
                         )
                     else:
                         for k, expected_v in validated.salidas.items():
@@ -340,8 +369,12 @@ def verify_derivation_phase_a(
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"Error al re-ejecutar script {validated.productor_ref!r}: {exc}")
 
-    if validated.productor_modo == "verificacion_codigo":
-        errors.extend(verify_sdd_code_derivation(paths, engagement_id, validated))
+    if validated.productor_modo in ("verificacion_codigo", "plugin_metodo") or (
+        extract_wikilink_id(validated.metodo) == "verificacion-sdd-codigo"
+    ):
+        for err in _load_and_run_method_validator_plugin(paths, engagement_id, "verificacion-sdd-codigo", validated):
+            if err not in errors:
+                errors.append(err)
 
     plugin_errors = _load_and_run_method_validator_plugin(paths, engagement_id, validated.metodo, validated)
     for err in plugin_errors:
@@ -396,14 +429,38 @@ def verify_finding_phase_a(
             continue
 
         try:
-            ev_obj, _, _ = validate_artifact_content(
-                ev_path.read_text(encoding="utf-8"),
+            ev_raw = ev_path.read_text(encoding="utf-8")
+            ev_obj, ev_meta, ev_body = validate_artifact_content(
+                ev_raw,
                 suffix=ev_path.suffix,
                 expected_tipo="evidencia",
             )
             assert isinstance(ev_obj, EvidenceContract)
             if rigor in ("L3", "L4") and not ev_obj.cita_verificada:
                 errors.append(f"La evidencia {ev_obj.id} tiene cita_verificada=False (bloqueante en {rigor}).")
+            if ev_obj.snapshot_local:
+                snap_guard = ExecutionGuard(
+                    paths,
+                    AgentExecutionContext(
+                        engagement_id=engagement_id,
+                        client_id="VERIFY",
+                        node_id="VERIFY-EVIDENCE",
+                        profile="documental",
+                    ),
+                )
+                snap_ok, computed_snap_hash = snap_guard._verify_evidence_snapshot_extract(ev_meta, ev_body)
+                if not snap_ok:
+                    errors.append(
+                        f"Evidencia {ev_obj.id} declara snapshot_local={ev_obj.snapshot_local!r}, pero el archivo no existe "
+                        "en referencias/ o no contiene el extracto textual declarado."
+                    )
+                elif ev_obj.hash_snapshot and computed_snap_hash and (
+                    ev_obj.hash_snapshot.removeprefix("sha256:") != computed_snap_hash.removeprefix("sha256:")
+                ):
+                    errors.append(
+                        f"hash_snapshot desactualizado en evidencia {ev_obj.id}: "
+                        f"declarado={ev_obj.hash_snapshot!r} vs actual={computed_snap_hash!r}."
+                    )
             age_days = (today - ev_obj.fecha_verificacion).days
             if age_days > ev_obj.vigencia_dias_max:
                 msg = f"Evidencia {ev_obj.id} vencida ({age_days} días > vigencia {ev_obj.vigencia_dias_max} días)."
@@ -525,12 +582,12 @@ def has_valid_content_bound_qa_verdict(
     finding_id: str,
     finding_path: Path,
 ) -> tuple[bool, bool]:
-    """Return (has_any_verdict_for_finding, has_matching_hash_approved_verdict)."""
+    """Return (has_any_verdict_for_finding, latest_verdict_approves_live_hash)."""
     qa_dir = paths.engagement_dir(engagement_id) / "QA"
     if not qa_dir.is_dir() or not finding_path.is_file():
         return False, False
     live_sha = compute_finding_substantive_sha256(finding_path)
-    saw_verdict = False
+    matched_verdicts: list[tuple[tuple[int, int, int, str], QAVerdictContract]] = []
     for vfile in qa_dir.glob("V-*.md"):
         try:
             v_obj, _, _ = validate_artifact_content(
@@ -541,13 +598,20 @@ def has_valid_content_bound_qa_verdict(
             assert isinstance(v_obj, QAVerdictContract)
             if extract_wikilink_id(v_obj.artefacto_auditado) != finding_id:
                 continue
-            saw_verdict = True
-            if v_obj.decision in ("aceptar", "aceptar_con_correcciones"):
-                if v_obj.sha256_artefacto_auditado == live_sha:
-                    return True, True
+            is_bless = 1 if (v_obj.id.startswith("V-BLESS-") or vfile.name.startswith("V-BLESS-")) else 0
+            sort_key = (is_bless, v_obj.ronda, vfile.stat().st_mtime_ns, vfile.name)
+            matched_verdicts.append((sort_key, v_obj))
         except ContractValidationError:
             continue
-    return saw_verdict, False
+    if not matched_verdicts:
+        return False, False
+    matched_verdicts.sort(key=lambda item: item[0])
+    latest_verdict = matched_verdicts[-1][1]
+    is_approved = (
+        latest_verdict.decision in ("aceptar", "aceptar_con_correcciones")
+        and latest_verdict.sha256_artefacto_auditado == live_sha
+    )
+    return True, is_approved
 
 
 def refresh_engagement_hashes_and_quarantine(

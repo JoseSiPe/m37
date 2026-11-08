@@ -48,6 +48,7 @@ from m37.router import (
 )
 from m37.runner import append_episodic_event, execute_stateless_node_loop
 from m37.schemas import (
+    REQUIRED_HEADINGS,
     ArchetypeContract,
     BriefContract,
     ContractValidationError,
@@ -56,7 +57,9 @@ from m37.schemas import (
     PlanContract,
     QAVerdictContract,
     RigorLevel,
+    compute_brief_substantive_sha256,
     compute_finding_substantive_sha256,
+    compute_plan_dag_sha256,
     dump_markdown_note,
     extract_wikilink_id,
     parse_raw_artifact,
@@ -84,40 +87,81 @@ class ClientLeakInCapitalError(PermissionError):
     """Raised when attempting to promote a finding containing client names to 50_Capital/."""
 
 
+DEMO_ORCS_SNAPSHOT_TEXT = (
+    "Observatorio Regional de Cadena de Suministro (ORCS) — Benchmark LatAm SaaS B2B Logístico 2026\n"
+    "Tabla 4.2 (pág. 38): Cohorte auditada de N = 312 empresas de transporte y distribución mid-market (50 a 250 unidades).\n\n"
+    "El segmento mid-market logístico en México y Colombia exhibió un crecimiento compuesto anual (CAGR) de 18.4% "
+    "entre 2023 y 2026, con un gasto promedio anual por contrato (ARPU) de USD 28,500, margen bruto de contribución "
+    "de 78% y una tasa de cancelación bruta anual (churn) mediana de 8.8%.\n"
+)
+
 DEMO_MODELO_VAN_SCRIPT = '''"""Modelo reproducible de flujo de caja descontado (DCF 36 meses) para DEMO-01 (ACME)."""
 import json
 
-# Parámetros extraídos de E-202610-001 (Benchmark LatAm SaaS B2B Logístico 2026, Tabla 4.2)
-clientes_encuestados_universo = 312
-tasa_captura_objetivo_36m = 0.35
-arpu_anual_musd = 0.0285
-margen_contribucion = 0.78
-churn_bruto_base = 0.088
-churn_bruto_estres = 0.132  # +50% sobre churn base
-wacc_anual = 0.12
-capex_despliegue_musd = 1.25
+# Parámetros auditados de E-202610-001 (ORCS 2026, Tabla 4.2, pág. 38) y restricciones de 00_Brief.md
+clientes_universo = 312
+altas_mensuales_flotas = 3.6          # ~113.7 flotas activas al mes 36 (36.4% del universo de 312)
+arpu_anual_musd = 0.0285              # USD 28,500 / año por flota
+arpu_mensual_musd = arpu_anual_musd / 12.0
+margen_contribucion = 0.78            # 78.0% margen bruto de contribución
+opex_fijo_mensual_musd = 0.015        # USD 180k / año soporte e infraestructura regional
+capex_despliegue_musd = 1.20          # Cumple tope <= USD 1.20M del Brief
+wacc_anual = 0.12                     # WACC 12.0% anual nominal USD
+churn_anual_base = 0.088              # 8.8% anual mediano (ORCS Tabla 4.2)
+churn_anual_estres_20 = round(churn_anual_base * 1.20, 6)  # 10.56% anual (+20% estrés relativo de churn)
 
-# Factores de valor presente acumulado a 36 meses (WACC 12% anual)
-factor_vp_base_36m = 1.671263
-factor_vp_estres_36m = 1.362072
 
-ingresos_netos_anuales_estabilizados = (
-    clientes_encuestados_universo * tasa_captura_objetivo_36m * arpu_anual_musd * margen_contribucion
-)
-van_base = (ingresos_netos_anuales_estabilizados * (1.0 - churn_bruto_base) * factor_vp_base_36m) - capex_despliegue_musd
-van_estres = (
-    ingresos_netos_anuales_estabilizados * (1.0 - churn_bruto_estres) * factor_vp_estres_36m
-) - capex_despliegue_musd
+def simular_flujos_mensuales(churn_anual: float) -> list[float]:
+    churn_mensual = 1.0 - (1.0 - churn_anual) ** (1.0 / 12.0)
+    flotas_activas = 0.0
+    flujos: list[float] = []
+    for _mes in range(1, 37):
+        flotas_activas = flotas_activas * (1.0 - churn_mensual) + altas_mensuales_flotas
+        fcf_mes = (flotas_activas * arpu_mensual_musd * margen_contribucion) - opex_fijo_mensual_musd
+        flujos.append(fcf_mes)
+    return flujos
 
-tir_estimada = round(wacc_anual + (round(van_base, 2) / capex_despliegue_musd) * 0.08367, 3)
-flujo_operativo_medio_mensual = (ingresos_netos_anuales_estabilizados * 0.363) / 12.0
-payback_meses = int(round(capex_despliegue_musd / flujo_operativo_medio_mensual))
+
+def calcular_van(tasa_anual: float, flujos_mensuales: list[float]) -> float:
+    tasa_mensual = (1.0 + tasa_anual) ** (1.0 / 12.0) - 1.0
+    vp_flujos = sum(fcf / ((1.0 + tasa_mensual) ** m) for m, fcf in enumerate(flujos_mensuales, start=1))
+    return -capex_despliegue_musd + vp_flujos
+
+
+def calcular_tir_anual_biseccion(flujos_mensuales: list[float]) -> float:
+    lo, hi = -0.50, 5.00
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        if calcular_van(mid, flujos_mensuales) > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def calcular_payback_acumulado_meses(flujos_mensuales: list[float]) -> int:
+    acumulado = 0.0
+    for mes, fcf in enumerate(flujos_mensuales, start=1):
+        acumulado += fcf
+        if acumulado >= capex_despliegue_musd:
+            return mes
+    return 36
+
+
+flujos_base = simular_flujos_mensuales(churn_anual_base)
+flujos_estres_20 = simular_flujos_mensuales(churn_anual_estres_20)
+
+van_base = round(calcular_van(wacc_anual, flujos_base), 2)
+tir_pct = round(calcular_tir_anual_biseccion(flujos_base) * 100.0, 1)
+payback_meses = calcular_payback_acumulado_meses(flujos_base)
+van_estres_20 = round(calcular_van(wacc_anual, flujos_estres_20), 2)
 
 salidas = {
-    "van_musd": round(van_base, 2),
-    "tir_pct": tir_estimada,
+    "van_musd": van_base,
+    "tir_pct": tir_pct,
     "payback_meses": payback_meses,
-    "van_estres_churn_musd": round(van_estres, 2),
+    "van_estres_churn_20_musd": van_estres_20,
+    "van_estres_churn_musd": van_estres_20,
 }
 print(json.dumps(salidas, ensure_ascii=False))
 '''
@@ -177,6 +221,7 @@ def init_workspace(
             paths.vault_root / "20_Encargos" / "DEMO-01_entrada-mercado",
             paths.vault_root / "30_Evidencia_Publica" / "E-202610-001.md",
             paths.analisis_root / "DEMO-01_entrada-mercado",
+            paths.referencias_root / "orcs_2026_tabla_4_2.txt",
         ):
             if demo_target.is_dir():
                 shutil.rmtree(demo_target)
@@ -195,6 +240,13 @@ def _synchronize_demo_hashes(paths: WorkspacePaths) -> None:
     if not demo_dir.is_dir():
         return
 
+    import json
+    from m37.guards import sha256_file
+
+    # Write verifiable local snapshot for primary evidence E-202610-001 in referencias/orcs_2026_tabla_4_2.txt
+    snap_path = paths.referencias_root / "orcs_2026_tabla_4_2.txt"
+    write_utf8_lf(snap_path, DEMO_ORCS_SNAPSHOT_TEXT)
+
     # Write reproducible DCF script for DEMO-01 in analisis/DEMO-01_entrada-mercado/modelo_van.py
     demo_script_path = paths.analisis_root / demo_id / "modelo_van.py"
     write_utf8_lf(demo_script_path, DEMO_MODELO_VAN_SCRIPT)
@@ -204,10 +256,34 @@ def _synchronize_demo_hashes(paths: WorkspacePaths) -> None:
         if fpath.is_file() and fpath.suffix.lower() in (".md", ".json", ".yaml", ".yml", ".base"):
             write_utf8_lf(fpath, fpath.read_text(encoding="utf-8"))
 
-    # Refresh Derivation input sha256s and script producer hash
-    from m37.guards import sha256_file
-    import json
+    # Stamp snapshot_local & hash_snapshot on E-202610-001.md
+    ev_demo_path = paths.vault_root / "30_Evidencia_Publica" / "E-202610-001.md"
+    if ev_demo_path.is_file():
+        ev_meta, ev_body = parse_raw_artifact(ev_demo_path.read_text(encoding="utf-8"), suffix=".md")
+        ev_meta["snapshot_local"] = "referencias/orcs_2026_tabla_4_2.txt"
+        ev_meta["hash_snapshot"] = f"sha256:{sha256_file(snap_path)}"
+        write_utf8_lf(ev_demo_path, dump_markdown_note(ev_meta, ev_body))
 
+    # Stamp puerta_1_sha256 on 00_Brief.md and puerta_2_sha256 on 01_Plan.md
+    brief_path = demo_dir / "00_Brief.md"
+    if brief_path.is_file():
+        b_meta, b_body = parse_raw_artifact(brief_path.read_text(encoding="utf-8"), suffix=".md")
+        if b_meta.get("puerta_1_aprobada"):
+            b_meta["puerta_1_sha256"] = compute_brief_substantive_sha256(b_meta, b_body)
+            write_utf8_lf(brief_path, dump_markdown_note(b_meta, b_body))
+
+    plan_path = demo_dir / "01_Plan.md"
+    if plan_path.is_file():
+        p_meta, p_body = parse_raw_artifact(plan_path.read_text(encoding="utf-8"), suffix=".md")
+        if p_meta.get("puerta_2_aprobada"):
+            npaths = [
+                demo_dir / "Nodos" / f"{extract_wikilink_id(str(n))}.md"
+                for n in (p_meta.get("nodos") or [])
+            ]
+            p_meta["puerta_2_sha256"] = compute_plan_dag_sha256(p_meta, p_body, npaths)
+            write_utf8_lf(plan_path, dump_markdown_note(p_meta, p_body))
+
+    # Refresh Derivation input sha256s and script producer hash
     deriv_dir = demo_dir / "Derivaciones"
     if deriv_dir.is_dir():
         for dfile in sorted(deriv_dir.glob("D-*")):
@@ -481,6 +557,15 @@ def generate_plan_from_archetype(
     if not brief_path.is_file():
         raise FileNotFoundError(f"No existe {brief_path}")
 
+    use_llm_orchestrator = bool(
+        orchestrator and orchestrator.strip().lower() not in ("deterministic", "determinista")
+    )
+    if use_llm_orchestrator and approve_gate_2:
+        raise PermissionError(
+            "No se permite combinar --orchestrator con --approve-gate-2: "
+            "el plan generado o modificado por un LLM Orquestador requiere revisión humana antes de aprobar Puerta 2."
+        )
+
     brief_obj, brief_meta, brief_body = validate_artifact_content(
         brief_path.read_text(encoding="utf-8"),
         suffix=".md",
@@ -488,14 +573,21 @@ def generate_plan_from_archetype(
     )
     assert isinstance(brief_obj, BriefContract)
 
-    if approve_gate_1 and not brief_obj.puerta_1_aprobada:
+    live_brief_sha = compute_brief_substantive_sha256(brief_meta, brief_body)
+    if approve_gate_1:
         brief_meta["puerta_1_aprobada"] = True
+        brief_meta["puerta_1_sha256"] = live_brief_sha
         write_utf8_lf(brief_path, dump_markdown_note(brief_meta, brief_body))
         brief_obj.puerta_1_aprobada = True
+        brief_obj.puerta_1_sha256 = live_brief_sha
 
     if not brief_obj.puerta_1_aprobada:
         raise PermissionError(
             f"Puerta 1 pendiente en {brief_path.name}: revisa el Brief y aprueba puerta_1_aprobada=true (o pasa --approve-gate-1)."
+        )
+    if brief_obj.puerta_1_sha256 and brief_obj.puerta_1_sha256 != live_brief_sha:
+        raise PermissionError(
+            f"Puerta 1 invalidada en {brief_path.name}: el contenido sustantivo del Brief cambió después de aprobarse."
         )
 
     catalog = load_model_catalog(paths.modelos_yaml_path())
@@ -564,7 +656,7 @@ def generate_plan_from_archetype(
         node_ids.append(spec_node.id)
         total_budget += routing.presupuesto_max_usd
 
-    plan_meta = {
+    plan_meta: dict[str, Any] = {
         "tipo": "plan",
         "id_plan": f"PLAN-{engagement_id}-v1",
         "version": 1,
@@ -573,7 +665,7 @@ def generate_plan_from_archetype(
         "arquetipo_base": arq_contract.id_arquetipo,
         "nodos": node_ids,
         "presupuesto_total_estimado_usd": round(total_budget, 2),
-        "puerta_2_aprobada": approve_gate_2,
+        "puerta_2_aprobada": bool(approve_gate_2 and not use_llm_orchestrator),
     }
     episodic_l2 = summarize_episodic_level2(episodios_file)
     plan_body = (
@@ -581,13 +673,16 @@ def generate_plan_from_archetype(
         + "\n".join(f"- `[[{nid}]]`" for nid in node_ids)
         + f"\n\n## Telemetría Episódica Nivel 2 Consultada\n\nRegistros históricos agregados: {len(episodic_l2)}.\n"
     )
+    if plan_meta["puerta_2_aprobada"]:
+        plan_meta["puerta_2_sha256"] = compute_plan_dag_sha256(plan_meta, plan_body, node_paths)
     plan_text = dump_markdown_note(plan_meta, plan_body)
     validate_artifact_content(plan_text, suffix=".md", expected_tipo="plan")
     plan_path = enc_dir / "01_Plan.md"
     write_utf8_lf(plan_path, plan_text)
 
     # Optional LLM-assisted orchestration when --orchestrator <alias> is explicitly provided
-    if orchestrator and orchestrator.strip().lower() not in ("deterministic", "determinista"):
+    if use_llm_orchestrator:
+        assert orchestrator is not None
         # SPEC-01 §5: Enforce L3/L4 Privacy Gate BEFORE sending Brief to LLM Orchestrator
         check_privacy_gate(brief_obj.nivel_rigor, effective_env)
         orq_alias, orq_entry = resolve_orchestrator_model(
@@ -636,9 +731,10 @@ def generate_plan_from_archetype(
             expected_tipo="plan",
         )
         assert isinstance(re_plan_obj, PlanContract)
-        if approve_gate_2 and not re_plan_obj.puerta_2_aprobada:
-            re_plan_meta["puerta_2_aprobada"] = True
-            write_utf8_lf(plan_path, dump_markdown_note(re_plan_meta, re_plan_body))
+        # LLM Orchestrator plans ALWAYS require human review for Gate 2
+        re_plan_meta["puerta_2_aprobada"] = False
+        re_plan_meta["puerta_2_sha256"] = None
+        write_utf8_lf(plan_path, dump_markdown_note(re_plan_meta, re_plan_body))
 
         validated_paths: list[Path] = []
         dag_pairs: list[tuple[str, list[str]]] = []
@@ -680,47 +776,134 @@ def _load_agent_instructions(paths: WorkspacePaths, role_name: str) -> str:
     return f"Rol: {role_name}"
 
 
-def _build_contract_reference_cheatsheet(node_obj: NodeContract) -> str:
-    """Provide canonical YAML frontmatter + heading templates for the node's required artifacts."""
-    kinds = _infer_required_artifact_kinds(node_obj)
+def _build_contract_reference_cheatsheet(node_obj: NodeContract | str | None = None) -> str:
+    """Provide canonical YAML frontmatter + heading templates matching schemas.py 1:1 for the node's required artifacts."""
+    if isinstance(node_obj, NodeContract):
+        kinds = _infer_required_artifact_kinds(node_obj)
+    else:
+        kinds = ["evidencia", "derivacion", "hallazgo", "entregable"]
     parts: list[str] = [
-        "## Referencia Rápida de Contratos (Pydantic v2 Fail-Closed)",
-        "- Usa la herramienta `allocate_next_id` para reservar el siguiente ID secuencial (`E`, `EI`, `D`, `H`, `V`).",
-        "- El kernel calcula automáticamente `hash_insumos` en Hallazgos y los `sha256` en Derivaciones al guardar.",
+        "## Referencia Rápida de Contratos (Pydantic v2 Fail-Closed — Extra Fields Forbidden)",
+        "- Usa `allocate_next_id` para reservar el siguiente ID secuencial (`E`, `EI`, `D`, `H`, `V`).",
+        "- Todos los contratos tienen `extra='forbid'`: no agregues llaves YAML/JSON fuera de las especificadas.",
+        "- El kernel calcula y estampa automáticamente `hash_insumos` en Hallazgos y los `sha256` en Derivaciones.",
     ]
     if "evidencia" in kinds:
+        ev_headings = ", ".join(f"`{h}`" for h in REQUIRED_HEADINGS["evidencia"])
         parts.append(
-            "### Esquema `evidencia` (`E-YYYYMM-NNN.md` o `EI-<ENC>-NNN.md`)\n"
-            "Campos YAML obligatorios: `id`, `tipo: evidencia`, `visibilidad` (`publica`|`interna_cliente`), "
-            "`cliente` (`null` si pública), `titulo`, `fuente_tipo` (`primaria_oficial`|`academica_arbitrada`|`prensa_especializada`|`documento_interno`|`entrevista`|`base_datos`), "
-            "`autor_organizacion`, `fecha_publicacion`, `fecha_captura`, `url_o_ubicacion`, `hash_archivo_fuente`, "
-            "`confianza_fuente` (`alta`|`media`|`baja`), `cita_verificada`, `invalidada: false`, `motivo_invalidacion: null`.\n"
-            "Encabezados `##` obligatorios: `## Extracto literal relevante`, `## Datos clave extraídos`, `## Notas de contexto y limitaciones`."
+            "### Esquema `evidencia` (`30_Evidencia_Publica/E-YYYYMM-NNN.md` o `Evidencia_Interna/EI-<ENC>-NN.md`)\n"
+            "Campos YAML exactos (`EvidenceContract`, `extra='forbid'`):\n"
+            "- `id`: `E-YYYYMM-NNN` o `EI-<ENC>-NN`\n"
+            "- `tipo`: `evidencia`\n"
+            "- `visibilidad`: `publica` (en `30_Evidencia_Publica/`) | `interna_encargo` (en `Evidencia_Interna/`)\n"
+            "- `encargo_origen`: `null` (si `publica`) o ID del encargo (obligatorio si `interna_encargo`)\n"
+            "- `clase`: `normativa` | `dato` | `literatura` | `entrevista` | `mercado` | `documento_interno` | `jurisprudencia` | `otro`\n"
+            "- `titulo`: string no vacío\n"
+            "- `emisor_o_autor`: string\n"
+            "- `fecha_publicacion`: string (`YYYY-MM` o `YYYY-MM-DD`) o `null`\n"
+            "- `fecha_verificacion`: `YYYY-MM-DD`\n"
+            "- `vigencia_dias_max`: entero > 0 (ej. `365`)\n"
+            "- `url`: string o `null`\n"
+            "- `localizador_verificable`: string >= 3 caracteres (ej. `\"Tabla 4.2, pág. 38\"`)\n"
+            "- `snapshot_local`: ruta en `referencias/...` devuelta por `web_fetch_clean` o archivo local\n"
+            "- `hash_snapshot`: estampado automáticamente por el kernel al verificar `snapshot_local`\n"
+            "- `fiabilidad`: `alta` | `media` | `baja`\n"
+            "- `cita_verificada`: booleano (el kernel verifica el extracto textual contra `snapshot_local`)\n"
+            "- `invalidada`: `false`\n"
+            "- `motivo_invalidacion`: `null`\n"
+            f"Encabezados `##` obligatorios: {ev_headings}."
         )
     if "derivacion" in kinds:
         parts.append(
-            "### Esquema `derivacion` (`Derivaciones/D-<ENC>-NN.json`)\n"
-            "Campos JSON obligatorios: `id`, `tipo: derivacion`, `encargo`, `nodo_origen`, `metodo` (`null` o `[[metodo]]`), "
-            "`productor_modo` (`script` obligatorio si `salidas` contiene números; `estructuracion_analitica` solo para salidas no numéricas; `verificacion_codigo` para software), "
-            "`productor_ref` (ruta al script en `analisis/<encargo>/...`), `productor_sha256`, `insumos` (`[{\"id_o_ruta\": \"[[E-...]]\", \"sha256\": \"...\"}]`), "
-            "`supuestos` (lista no vacía), `salidas` (diccionario clave->valor), `verificacion_Mecanica_ok: true`, `invalidada: false`."
+            "### Esquema `derivacion` (`Derivaciones/D-<ENC>-NN.json` o `.md`)\n"
+            "Campos JSON/YAML exactos (`DerivationContract`, `extra='forbid'`):\n"
+            "- `id`: `D-<ENC>-NN`\n"
+            "- `tipo`: `derivacion`\n"
+            "- `encargo`: ID del encargo\n"
+            "- `metodo`: slug seguro `^[a-z0-9][a-z0-9_-]*$` (ej. `matriz-comparativa-alternativas` o `verificacion-sdd-codigo`)\n"
+            "- `productor_modo`: `script` (obligatorio si hay cifras numéricas; el kernel ejecuta el script y estampa `salidas` desde stdout JSON) | `verificacion_codigo` | `estructuracion_analitica` (solo para salidas sin números)\n"
+            "- `productor_ref`: ruta al script en `analisis/<encargo>/...` o directorio `codigo/<encargo>`\n"
+            "- `productor_sha256`: estampado automáticamente por el kernel\n"
+            "- `insumos`: `[{\"id_o_ruta\": \"E-...\", \"sha256\": \"...\"}]`\n"
+            "- `salidas`: diccionario no vacío clave->valor\n"
+            "- `metadatos_metodo`: diccionario `{}`\n"
+            "- `invalidada`: `false`\n"
+            "- `motivo_invalidacion`: `null`"
         )
     if "hallazgo" in kinds:
+        hal_headings = ", ".join(f"`{h}`" for h in REQUIRED_HEADINGS["hallazgo"])
         parts.append(
             "### Esquema `hallazgo` (`Hallazgos/H-<ENC>-NN.md`)\n"
-            "Campos YAML obligatorios: `id`, `tipo: hallazgo`, `encargo`, `nodo_origen`, `dominio`, `metodo`, "
-            "`fuerza_afirmacion` (`observacion_acotada`|`inferencia_soportada`|`recomendacion_condicionada`|`prescripcion_accionable`), "
-            "`afirmacion_corta` (<=160 chars), `confianza` (`alta`|`media`|`baja`), `sustento_evidencia` (`[\"[[E-...]]\"]`), "
-            "`sustento_derivaciones` (`[\"[[D-...]]\"]`), `hash_insumos`, `contrahipotesis_probadas` (mínimo 1 en L3, 2 en L4), "
-            "`limitaciones` (lista no vacía), `estado_qa: pendiente`, `promovible_a_capital: false`.\n"
-            "Encabezados `##` obligatorios: `## Tesis del hallazgo`, `## Cadena de derivación`, `## Falsación e intentos de quiebre`, `## Implicación para la decisión`."
+            "Campos YAML exactos (`FindingContract`, `extra='forbid'`):\n"
+            "- `id`: `H-<ENC>-NN`\n"
+            "- `tipo`: `hallazgo`\n"
+            "- `encargo`: ID del encargo\n"
+            "- `dominio`: slug del dominio (ej. `estrategia-base`)\n"
+            "- `naturaleza`: `estrategico` | `normativo` | `empirico` | `organizacional` | `tecnico` | `sintesis`\n"
+            "- `fuerza_afirmacion`: `observacion_acotada` | `inferencia_condicionada` | `tesis_estructural_o_causal` | `prescripcion_accionable`\n"
+            "- `afirmacion_corta`: string >= 15 caracteres\n"
+            "- `sustento_evidencia`: lista `[\"[[E-...]]\"]`\n"
+            "- `sustento_derivaciones`: lista `[\"[[D-...]]\"]`\n"
+            "- `metodo`: slug seguro `^[a-z0-9][a-z0-9_-]*$`\n"
+            "- `valores_anclados`: diccionario `{clave: valor}` que coincide con `salidas` de las Derivaciones citadas\n"
+            "- `hash_insumos`: estampado automáticamente por el kernel\n"
+            "- `confianza`: `alta` | `media` | `baja`\n"
+            "- `estado_qa`: `pendiente` (forzado por el kernel)\n"
+            "- `contrahipotesis_probadas`: entero >= 1 en L3/L4\n"
+            "- `que_lo_refutaria`: string >= 10 caracteres\n"
+            "- `promovible_a_capital`: booleano (`false` por defecto)\n"
+            f"Encabezados `##` obligatorios: {hal_headings}."
         )
     if "entregable" in kinds:
         parts.append(
             "### Regla de Entregable (`Entregables/*.md`)\n"
-            "Cada párrafo sustantivo debe cerrar con `<!-- sustento: H-XX -->` y toda cifra debe interpolarse con `{{D-XX.clave}}`."
+            "Cada párrafo sustantivo debe cerrar con `<!-- sustento: H-XX -->`, toda cifra debe interpolarse con `{{D-XX.clave}}`, "
+            "y están prohibidos bloques ejecutables Quarto (` ```{python} `) o HTML crudo (`<script>`, `<img>`, `<iframe>`)."
         )
     return "\n\n".join(parts)
+
+
+def _build_qa_verdict_cheatsheet(
+    paths: WorkspacePaths,
+    audited_id: str,
+    verdict_id: str,
+    verdict_rel_path: str,
+    ronda: int,
+    allowlist: frozenset[Path],
+) -> str:
+    """Build exact file allowlist and QAVerdictContract schema instructions for the Blind QA agent."""
+    ws_root = paths.workspace_root.resolve()
+    rel_allowed: list[str] = []
+    for p in sorted(allowlist):
+        try:
+            rel_allowed.append(p.resolve().relative_to(ws_root).as_posix())
+        except ValueError:
+            continue
+    allowed_list_md = "\n".join(f"  - `{r}`" for r in rel_allowed)
+    return (
+        f"## Instrucciones de QA Ciego (Ronda {ronda})\n"
+        f"- Artefacto asignado obligatoriamente: `{audited_id}`.\n"
+        f"- Ruta obligatoria de salida: `{verdict_rel_path}` con `id: {verdict_id}`.\n"
+        "- Lista blanca cerrada de archivos legibles con `read_file`:\n"
+        f"{allowed_list_md}\n\n"
+        "### Esquema `veredicto_qa` (`QAVerdictContract`, `extra='forbid'`)\n"
+        "- `id`: `" + verdict_id + "`\n"
+        "- `tipo`: `veredicto_qa`\n"
+        "- `encargo`: ID del encargo\n"
+        f"- `artefacto_auditado`: `'[[{audited_id}]]'`\n"
+        "- `sha256_artefacto_auditado`: estampado automáticamente por el kernel\n"
+        f"- `ronda`: `{ronda}`\n"
+        "- `modelo_auditor`: alias del modelo\n"
+        "- `familia_auditor`: familia del modelo\n"
+        "- `revision_ciega_verificada`: `true`\n"
+        "- `fase_a_mecanica`: `aprobada` | `fallida`\n"
+        "- `mejor_ataque`: string (>= 20 caracteres)\n"
+        "- `hallazgos_critica`: lista de objetos `{id_defecto ('DEF-01'), severidad ('bloqueante'|'mayor'|'menor'|'sugerencia'), "
+        "categoria ('sustento_no_respalda_afirmacion'|'inflacion_fuerza_epistemica'|'violacion_limite_fuente'|'salto_logico_o_metodologico'|'omision_contrahipotesis'|'incumplimiento_spec_o_test'|'riesgo_seguridad_codigo'|'formato_o_claridad'), "
+        "exige_cambio_material (bool), ubicacion, evidencia, remediacion}`\n"
+        "- `resolucion_ronda_previa`: diccionario `{}` (en Ronda 2, mapea cada `DEF-*` a `'resuelto_materialmente'|'persiste'`)\n"
+        "- `decision`: `aceptar` | `aceptar_con_correcciones` | `rechazar`\n"
+    )
 
 
 def run_engagement(
@@ -735,15 +918,21 @@ def run_engagement(
     """SPEC-02 §4 & SPEC-03 §2.3: Execute DAG nodes with Phase A + Cross-Family Blind QA + Ronda 2 Gate."""
     effective_env = dict(env) if env is not None else load_effective_env()
     enc_dir = paths.engagement_dir(engagement_id)
+    brief_path = enc_dir / "00_Brief.md"
 
-    brief_obj, _, _ = validate_artifact_content(
-        (enc_dir / "00_Brief.md").read_text(encoding="utf-8"),
+    brief_obj, brief_meta, brief_body = validate_artifact_content(
+        brief_path.read_text(encoding="utf-8"),
         suffix=".md",
         expected_tipo="brief",
     )
     assert isinstance(brief_obj, BriefContract)
     if not brief_obj.puerta_1_aprobada:
         raise PermissionError("Puerta 1 no aprobada en 00_Brief.md.")
+    live_brief_sha = compute_brief_substantive_sha256(brief_meta, brief_body)
+    if brief_obj.puerta_1_sha256 and brief_obj.puerta_1_sha256 != live_brief_sha:
+        raise PermissionError(
+            "Puerta 1 invalidada: el contenido sustantivo de 00_Brief.md fue modificado después de su aprobación."
+        )
 
     # SPEC-01 §5: Enforce L3/L4 Privacy Gate BEFORE sending a single token
     check_privacy_gate(brief_obj.nivel_rigor, effective_env)
@@ -755,12 +944,26 @@ def run_engagement(
         expected_tipo="plan",
     )
     assert isinstance(plan_obj, PlanContract)
-    if approve_gate_2 and not plan_obj.puerta_2_aprobada:
+    all_plan_node_paths = [
+        enc_dir / "Nodos" / f"{extract_wikilink_id(n)}.md" for n in plan_obj.nodos
+    ]
+    for np in all_plan_node_paths:
+        if not np.is_file():
+            raise FileNotFoundError(f"El nodo declarado en 01_Plan.md no existe en disco: {np.name}")
+
+    live_plan_sha = compute_plan_dag_sha256(plan_meta, plan_body, all_plan_node_paths)
+    if approve_gate_2:
         plan_meta["puerta_2_aprobada"] = True
+        plan_meta["puerta_2_sha256"] = live_plan_sha
         write_utf8_lf(plan_path, dump_markdown_note(plan_meta, plan_body))
         plan_obj.puerta_2_aprobada = True
+        plan_obj.puerta_2_sha256 = live_plan_sha
     if not plan_obj.puerta_2_aprobada:
         raise PermissionError("Puerta 2 no aprobada en 01_Plan.md (usa puerta_2_aprobada=true o --approve-gate-2).")
+    if plan_obj.puerta_2_sha256 and plan_obj.puerta_2_sha256 != live_plan_sha:
+        raise PermissionError(
+            "Puerta 2 invalidada: 01_Plan.md o la configuración de Nodos/ fue modificada después de aprobar Puerta 2."
+        )
 
     catalog = load_model_catalog(paths.modelos_yaml_path())
     active = filter_active_models(catalog, effective_env)
@@ -771,6 +974,8 @@ def run_engagement(
 
     for nid in node_ids:
         npath = enc_dir / "Nodos" / f"{nid}.md"
+        if not npath.is_file():
+            raise FileNotFoundError(f"No existe el archivo del nodo a ejecutar: {npath.name}")
         node_obj, node_meta, node_body = validate_artifact_content(
             npath.read_text(encoding="utf-8"),
             suffix=".md",
@@ -781,16 +986,19 @@ def run_engagement(
             results[nid] = {"estado": "aceptado", "skipped": True}
             continue
 
-        # Check dependencies (fail-closed: any non-accepted upstream blocks execution)
+        # Check dependencies (fail-closed: missing or non-accepted upstream blocks execution)
         for dep_raw in node_obj.depende_de:
             dep_id = extract_wikilink_id(dep_raw)
             dep_path = enc_dir / "Nodos" / f"{dep_id}.md"
-            if dep_path.is_file():
-                dep_meta, _ = parse_raw_artifact(dep_path.read_text(encoding="utf-8"), suffix=".md")
-                if dep_meta.get("estado") != "aceptado":
-                    raise RuntimeError(
-                        f"No se puede ejecutar {nid}: dependencia {dep_id} en estado {dep_meta.get('estado')!r}."
-                    )
+            if not dep_path.is_file():
+                raise RuntimeError(
+                    f"No se puede ejecutar {nid}: el nodo dependencia {dep_id!r} ({dep_path.name}) no existe."
+                )
+            dep_meta, _ = parse_raw_artifact(dep_path.read_text(encoding="utf-8"), suffix=".md")
+            if dep_meta.get("estado") != "aceptado":
+                raise RuntimeError(
+                    f"No se puede ejecutar {nid}: dependencia {dep_id} en estado {dep_meta.get('estado')!r}."
+                )
 
         resolved_routing = validate_node_routing(node_obj, catalog, active, brief_obj.nivel_rigor)
 
@@ -802,7 +1010,7 @@ def run_engagement(
 
         sys_prompt = f"{agent_instructions}\n\n{skill_instructions}\n\n{contract_cheatsheet}".strip()
         user_prompt = (
-            f"# Brief del Encargo ({engagement_id})\n{(enc_dir / '00_Brief.md').read_text(encoding='utf-8')}\n\n"
+            f"# Brief del Encargo ({engagement_id})\n{brief_path.read_text(encoding='utf-8')}\n\n"
             f"# Contrato del Nodo ({nid})\n{npath.read_text(encoding='utf-8')}"
         )
 
@@ -814,6 +1022,7 @@ def run_engagement(
             model_alias=resolved_routing.executor_alias,
             model_family=resolved_routing.executor_entry.familia,
             allow_surgical_edit=resolved_routing.allow_surgical_edit,
+            allow_compute=node_obj.requiere_computo,
             env_secrets=env_secrets,
             base_env=effective_env,
         )
@@ -901,9 +1110,18 @@ def run_engagement(
                     allowlist_r1 = build_blind_qa_allowlist(paths, engagement_id, hpath, ronda=1)
 
                     qa_sys = _load_agent_instructions(paths, "qa-critico")
+                    qa_cheatsheet_r1 = _build_qa_verdict_cheatsheet(
+                        paths,
+                        audited_id=hpath.stem,
+                        verdict_id=v_r1_id,
+                        verdict_rel_path=v_r1_rel,
+                        ronda=1,
+                        allowlist=allowlist_r1,
+                    )
                     qa_user = (
                         f"Audita en Ronda 1 el artefacto `{hpath.name}` del encargo `{engagement_id}` y "
-                        f"escribe el veredicto en `{v_r1_rel}` con id `{v_r1_id}`."
+                        f"escribe el veredicto en `{v_r1_rel}` con id `{v_r1_id}`.\n\n"
+                        f"{qa_cheatsheet_r1}"
                     )
                     qa_ctx = AgentExecutionContext(
                         engagement_id=engagement_id,
@@ -913,7 +1131,9 @@ def run_engagement(
                         model_alias=resolved_routing.qa_alias,
                         model_family=resolved_routing.qa_entry.familia,
                         allow_surgical_edit=False,
+                        allow_compute=False,
                         blind_qa_allowlist=allowlist_r1,
+                        assigned_qa_target=hpath.stem,
                         env_secrets=env_secrets,
                         base_env=effective_env,
                     )
@@ -944,6 +1164,10 @@ def run_engagement(
                         expected_tipo="veredicto_qa",
                     )
                     assert isinstance(v1_obj, QAVerdictContract)
+                    if extract_wikilink_id(v1_obj.artefacto_auditado) != hpath.stem:
+                        _set_finding_qa_state(hpath, "rechazado")
+                        final_node_state = "escalado_humano"
+                        continue
                     veredicto_qa_r1_str = v1_obj.decision
 
                     if v1_obj.decision == "aceptar":
@@ -1034,6 +1258,14 @@ def run_engagement(
                             ronda=2,
                             prior_verdict_path=v_r1_abs,
                         )
+                        qa_cheatsheet_r2 = _build_qa_verdict_cheatsheet(
+                            paths,
+                            audited_id=hpath.stem,
+                            verdict_id=v_r2_id,
+                            verdict_rel_path=v_r2_rel,
+                            ronda=2,
+                            allowlist=allowlist_r2,
+                        )
                         qa_ctx_r2 = AgentExecutionContext(
                             engagement_id=engagement_id,
                             client_id=brief_obj.cliente,
@@ -1042,7 +1274,9 @@ def run_engagement(
                             model_alias=resolved_routing.qa_alias,
                             model_family=resolved_routing.qa_entry.familia,
                             allow_surgical_edit=False,
+                            allow_compute=False,
                             blind_qa_allowlist=allowlist_r2,
+                            assigned_qa_target=hpath.stem,
                             env_secrets=env_secrets,
                             base_env=effective_env,
                         )
@@ -1051,7 +1285,8 @@ def run_engagement(
                             qa_ctx_r2,
                             resolved_routing.qa_entry,
                             qa_sys,
-                            f"Audita en Ronda 2 `{hpath.name}` contrastando con `{v_r1_abs.name}` y escribe `{v_r2_rel}` con id `{v_r2_id}`.",
+                            f"Audita en Ronda 2 `{hpath.name}` contrastando con `{v_r1_abs.name}` y escribe `{v_r2_rel}` con id `{v_r2_id}`.\n\n"
+                            f"{qa_cheatsheet_r2}",
                             max_turns=8,
                             budget_max_usd=rem_qa2,
                             completion_fn=completion_fn,
@@ -1069,7 +1304,10 @@ def run_engagement(
                                 expected_tipo="veredicto_qa",
                             )
                             assert isinstance(v2_obj, QAVerdictContract)
-                            if v2_obj.decision in ("aceptar", "aceptar_con_correcciones"):
+                            if (
+                                extract_wikilink_id(v2_obj.artefacto_auditado) == hpath.stem
+                                and v2_obj.decision in ("aceptar", "aceptar_con_correcciones")
+                            ):
                                 _set_finding_qa_state(hpath, "aprobado_con_correcciones")
                                 node_meta["rondas_qa"] = 2
                             else:
@@ -1085,6 +1323,18 @@ def run_engagement(
 
         node_meta["estado"] = final_node_state
         write_utf8_lf(npath, dump_markdown_note(node_meta, node_body))
+
+        # Refresh puerta_2_sha256 after kernel-updated node state so subsequent single-node runs remain valid
+        if plan_obj.puerta_2_aprobada and plan_obj.puerta_2_sha256:
+            _, latest_p_meta, latest_p_body = validate_artifact_content(
+                plan_path.read_text(encoding="utf-8"),
+                suffix=".md",
+                expected_tipo="plan",
+            )
+            latest_p_meta["puerta_2_sha256"] = compute_plan_dag_sha256(
+                latest_p_meta, latest_p_body, all_plan_node_paths
+            )
+            write_utf8_lf(plan_path, dump_markdown_note(latest_p_meta, latest_p_body))
 
         rounded_cost = round(total_node_cost, 6)
         append_episodic_event(
@@ -1146,8 +1396,19 @@ def bless_finding(
     if len(justification.strip()) < 15:
         raise ValueError("La justificación de m37 bless debe tener al menos 15 caracteres.")
 
+    brief_path = paths.engagement_dir(engagement_id) / "00_Brief.md"
+    effective_rigor: RigorLevel = "L3"
+    if brief_path.is_file():
+        b_obj, _, _ = validate_artifact_content(
+            brief_path.read_text(encoding="utf-8"),
+            suffix=".md",
+            expected_tipo="brief",
+        )
+        assert isinstance(b_obj, BriefContract)
+        effective_rigor = b_obj.nivel_rigor
+
     h_path = resolve_artifact_by_id(paths, engagement_id, finding_id)
-    phase_a = verify_finding_phase_a(paths, engagement_id, h_path, rigor="L3")
+    phase_a = verify_finding_phase_a(paths, engagement_id, h_path, rigor=effective_rigor)
     if not phase_a.passed:
         raise ValueError(
             "No se puede bendecir un Hallazgo que falla Fase A mecánica (fuentes rotas, cuarentena o hash inválido): "
@@ -1165,7 +1426,7 @@ def bless_finding(
         "ronda": 2,
         "modelo_auditor": author,
         "familia_auditor": "humano",
-        "revision_ciega_verificada": True,
+        "revision_ciega_verificada": False,
         "fase_a_mecanica": "aprobada",
         "mejor_ataque": f"Revisión humana de escalamiento: {justification.strip()}",
         "hallazgos_critica": [],
@@ -1174,7 +1435,10 @@ def bless_finding(
     }
     verdict_text = dump_markdown_note(
         verdict_meta,
-        f"## Acta de Aprobación Humana (`m37 bless`)\n\nAutor: `{author}`\n\nJustificación: {justification.strip()}\n",
+        "## Resumen del Dictamen\n\n"
+        f"Acta de aprobación humana (`m37 bless`) firmada por `{author}`.\n\n"
+        "## Detalle de Crítica Adversarial\n\n"
+        f"Justificación de desbloqueo humano: {justification.strip()}\n",
     )
     validate_artifact_content(verdict_text, suffix=".md", expected_tipo="veredicto_qa")
     v_path = paths.engagement_dir(engagement_id) / "QA" / f"{verdict_id}.md"
@@ -1273,7 +1537,7 @@ def close_engagement(
     leccion: str = "Encargo cerrado con trazabilidad verificada.",
     promote_capital: bool = True,
 ) -> dict[str, Any]:
-    """SPEC-05 §3.1: Write Level 1 episodic card and promote sanitized findings to 50_Capital/ blocking client leaks."""
+    """SPEC-05 §3.1: Write Level 1 episodic card and promote sanitized findings to 50_Capital/ atomically."""
     enc_dir = paths.engagement_dir(engagement_id)
     brief_obj, _, _ = validate_artifact_content(
         (enc_dir / "00_Brief.md").read_text(encoding="utf-8"),
@@ -1282,25 +1546,26 @@ def close_engagement(
     )
     assert isinstance(brief_obj, BriefContract)
 
-    # Collect all client names in 10_Clientes/ + brief.cliente to block confidentiality leaks into 50_Capital/
-    client_tokens = {brief_obj.cliente.strip()}
+    # Collect all client names in 10_Clientes/ + brief.cliente + engagement_id to block confidentiality leaks into 50_Capital/
+    forbidden_tokens = {brief_obj.cliente.strip(), engagement_id.strip()}
     clients_root = paths.vault_root / "10_Clientes"
     if clients_root.is_dir():
         for cdir in clients_root.iterdir():
             if cdir.is_dir() and len(cdir.name.strip()) >= 2:
-                client_tokens.add(cdir.name.strip())
+                forbidden_tokens.add(cdir.name.strip())
 
+    # Match across underscores/hyphens/punctuation (e.g. 'ACME_latam' or 'ACME-2026' is still caught)
     leak_patterns = [
-        (tok, re.compile(rf"\b{re.escape(tok)}\b", re.IGNORECASE))
-        for tok in sorted(client_tokens)
+        (tok, re.compile(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9])", re.IGNORECASE))
+        for tok in sorted(forbidden_tokens)
         if tok
     ]
 
-    promoted: list[str] = []
+    staged_promotions: list[tuple[str, Path, str]] = []
     hallazgos_dir = enc_dir / "Hallazgos"
     if promote_capital and hallazgos_dir.is_dir():
         for hfile in sorted(hallazgos_dir.glob("H-*.md")):
-            f_obj, f_meta, f_body = validate_artifact_content(
+            f_obj, _, f_body = validate_artifact_content(
                 hfile.read_text(encoding="utf-8"),
                 suffix=".md",
                 expected_tipo="hallazgo",
@@ -1316,7 +1581,7 @@ def close_engagement(
                 if pat.search(combined_text):
                     raise ClientLeakInCapitalError(
                         f"Bloqueo de confidencialidad en promoción a 50_Capital/: el Hallazgo {f_obj.id} "
-                        f"menciona al cliente {tok!r}. Anonimiza el hallazgo antes de cerrar el encargo."
+                        f"menciona al cliente o encargo {tok!r}. Anonimiza el hallazgo antes de cerrar el encargo."
                     )
 
             cap_id = f"C-{f_obj.id}"
@@ -1330,8 +1595,13 @@ def close_engagement(
                 "fecha_promocion": date.today().isoformat(),
             }
             cap_path = paths.vault_root / "50_Capital" / f"{cap_id}.md"
-            write_utf8_lf(cap_path, dump_markdown_note(cap_meta, f_body))
-            promoted.append(cap_id)
+            staged_promotions.append((cap_id, cap_path, dump_markdown_note(cap_meta, f_body)))
+
+    # Atomic commit: only write to 50_Capital/ after ALL findings pass the confidentiality scan
+    promoted: list[str] = []
+    for cap_id, cap_path, serialized_cap in staged_promotions:
+        write_utf8_lf(cap_path, serialized_cap)
+        promoted.append(cap_id)
 
     ep_note_path = paths.vault_root / "90_Bitacora" / f"EP-{engagement_id}.md"
     ep_meta = {

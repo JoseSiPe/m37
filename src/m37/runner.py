@@ -252,6 +252,10 @@ def get_tool_schemas_for_context(ctx: AgentExecutionContext) -> list[dict[str, A
     if not ctx.allow_surgical_edit:
         allowed.discard("edit_note")
         allowed.discard("edit_code_file")
+    if not ctx.allow_compute:
+        allowed.discard("write_sandbox_script")
+        allowed.discard("run_sandbox_script")
+        allowed.discard("run_verification_cmd")
     return [ALL_TOOL_SCHEMAS[name] for name in sorted(allowed) if name in ALL_TOOL_SCHEMAS]
 
 
@@ -330,9 +334,14 @@ def execute_stateless_node_loop(
     completion_fn: Callable[..., Any] | None = None,
 ) -> RunnerOutcome:
     """SPEC-02 §1 & §4: Execute an ephemeral, zero-memory-carryover multi-turn tool loop for a single node."""
+    import os
+
     guard = ExecutionGuard(paths, ctx)
     tools = get_tool_schemas_for_context(ctx)
     call_llm = completion_fn or litellm.completion
+    explicit_api_key = (
+        ctx.base_env.get(model_entry.credencial_env) or os.environ.get(model_entry.credencial_env) or ""
+    ).strip()
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -348,12 +357,32 @@ def execute_stateless_node_loop(
     cost_source = "catalogo"
 
     for turn in range(1, max_turns + 1):
-        response = call_llm(
-            model=model_entry.litellm_id,
-            messages=messages,
-            tools=tools if tools else None,
-            temperature=model_entry.limites_operativos.temperatura_recomendada,
-        )
+        call_kwargs: dict[str, Any] = {
+            "model": model_entry.litellm_id,
+            "messages": messages,
+            "tools": tools if tools else None,
+            "temperature": model_entry.limites_operativos.temperatura_recomendada,
+        }
+        if completion_fn is None:
+            call_kwargs["max_tokens"] = model_entry.limites_operativos.max_output_tokens
+            if explicit_api_key:
+                call_kwargs["api_key"] = explicit_api_key
+
+        try:
+            response = call_llm(**call_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            return RunnerOutcome(
+                status="error_proveedor_llm",
+                final_message=f"Fallo de proveedor LLM en turno {turn} ({model_entry.litellm_id}): {type(exc).__name__}: {exc}",
+                turns_used=turn,
+                prompt_tokens=total_in_tokens,
+                completion_tokens=total_out_tokens,
+                cost_usd=round(total_cost_usd, 6),
+                written_files=written_files,
+                guard_violations=guard_violations,
+                contract_errors=contract_errors,
+                cost_source=cost_source,
+            )
 
         # Extract token usage & compute cost via litellm.completion_cost() with catalog fallback
         usage = getattr(response, "usage", None) or (response.get("usage") if isinstance(response, dict) else None)

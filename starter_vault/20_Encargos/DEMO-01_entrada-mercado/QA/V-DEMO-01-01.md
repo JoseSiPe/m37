@@ -23,4 +23,4 @@ decision: aceptar
 
 ## Dictamen de Auditoría Ciega Cruzada
 
-El hallazgo `H-DEMO-01-01` respeta estrictamente los límites muestrales de `E-202610-001` (excluyendo micro-flotas <15 unidades), ancla fielmente los valores de `D-DEMO-01-01` (incluyendo escenario de estrés de churn con VAN = USD 1.62M > umbral de USD 1.50M) y calibra adecuadamente sus condiciones de refutación.
+El hallazgo `H-DEMO-01-01` respeta estrictamente los límites muestrales de `E-202610-001` (excluyendo micro-flotas <15 unidades), ancla fielmente los valores de `D-DEMO-01-01` (incluyendo escenario de estrés de churn con VAN = USD 1.54M > umbral de USD 1.50M) y calibra adecuadamente sus condiciones de refutación.

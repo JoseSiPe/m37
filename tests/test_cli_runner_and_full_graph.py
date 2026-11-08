@@ -35,9 +35,9 @@ def test_out_of_box_demo_compile_html_and_quarto_graceful_fallback(tmp_path: Pat
     assert out.traceability_map_path.is_file()
 
     html_text = out.html_path.read_text(encoding="utf-8")
-    assert "USD 2.45M" in html_text
-    assert "28.4%" in html_text
-    assert "17 meses" in html_text
+    assert "USD 1.60M" in html_text
+    assert "74.2%" in html_text
+    assert "22 meses" in html_text
     assert "<!-- sustento:" not in html_text
     assert "Tabla 4.2, pág. 38" in html_text
 

@@ -13,12 +13,14 @@
     }
   ],
   "salidas": {
-    "van_musd": 2.45,
-    "tir_pct": 0.284,
-    "payback_meses": 17,
-    "van_estres_churn_musd": 1.62
+    "van_musd": 1.6,
+    "tir_pct": 74.2,
+    "payback_meses": 22,
+    "van_estres_churn_20_musd": 1.54,
+    "van_estres_churn_musd": 1.54
   },
   "metadatos_metodo": {
+    "capex_despliegue_musd": 1.2,
     "tasa_descuento_anual": 0.12,
     "horizonte_meses": 36
   },

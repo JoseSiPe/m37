@@ -32,7 +32,7 @@ Evaluación de demostración incluida en `starter_vault/` para comprobar de extr
 
 ## Criterios de fracaso
 
-- `VAN < USD 1.50M` al 12% anual o periodo de recuperación (`payback`) superior a 24 meses.
+- `VAN < USD 1.50M` al 12% anual, `TIR < 18.0%` anual o periodo de recuperación (`payback`) superior a 24 meses.
 
 ## Restricciones
 

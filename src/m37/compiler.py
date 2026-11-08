@@ -42,6 +42,39 @@ INTERPOLATION_RE = re.compile(
     r"\{\{\s*([A-Za-z0-9_-]+)\.([A-Za-z0-9_.-]+)(?:\s*\|\s*fmt\(\s*['\"]([^'\"]*)['\"]\s*\))?\s*\}\}"
 )
 WIKILINK_INLINE_RE = re.compile(r"(?<!!)\[\[([^\]#|]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]")
+EXECUTABLE_FENCE_RE = re.compile(r"^`{3,}\s*\{\s*[A-Za-z0-9_+-]+", re.MULTILINE)
+DANGEROUS_RAW_HTML_RE = re.compile(
+    r"<\s*/?\s*(script|img|iframe|object|embed|svg|link|style|form|input|meta|base|audio|video)\b",
+    re.IGNORECASE,
+)
+RAW_HTML_TAG_RE = re.compile(r"<(/?[A-Za-z!][^>]*>)")
+UNCONDITIONED_GUARANTEE_RE = re.compile(
+    r"\b(garantiza(?:do|da|n|mos)?\s+sin\s+riesgo|éxito\s+garantizado|exito\s+garantizado|"
+    r"cero\s+riesgo|100%\s+seguro|certeza\s+absoluta|infalible)\b",
+    re.IGNORECASE,
+)
+PROSE_QUANT_METRIC_RE = re.compile(
+    r"(?:(?:USD|MXN|EUR|\$)\s*\d+(?:[.,]\d+)?\s*(?:M|MM|K|B|millones|mil)?\b"
+    r"|\b\d+(?:[.,]\d+)?\s*%"
+    r"|\b\d+(?:[.,]\d+)?\s+(?:meses|años)\b)",
+    re.IGNORECASE,
+)
+
+
+def _extract_numeric_tokens(text: str) -> set[str]:
+    """Extract normalized numeric tokens (e.g. '2.45', '18.4', '12', '20') from text/values."""
+    tokens: set[str] = set()
+    for m in re.finditer(r"\d+(?:[.,]\d+)?", text):
+        norm = m.group(0).replace(",", ".")
+        tokens.add(norm)
+        try:
+            fval = float(norm)
+            tokens.add(f"{fval:g}")
+            tokens.add(f"{fval:.1f}")
+            tokens.add(f"{fval:.2f}")
+        except ValueError:
+            pass
+    return tokens
 
 
 class CompilerAbortError(RuntimeError):
@@ -280,8 +313,9 @@ def compile_deliverable(
     if not brief_path.is_file():
         raise FileNotFoundError(f"Falta 00_Brief.md en {enc_dir}.")
 
+    brief_raw = brief_path.read_text(encoding="utf-8")
     brief_obj, _, _ = validate_artifact_content(
-        brief_path.read_text(encoding="utf-8"),
+        brief_raw,
         suffix=".md",
         expected_tipo="brief",
     )
@@ -306,8 +340,21 @@ def compile_deliverable(
     title = str(deliv_meta.get("titulo") or f"Informe — {brief_obj.id_encargo}")
 
     # ==================================================================
-    # PASS 1: Structural Segmentation & Orphan-Block Detection (exit 2)
+    # PASS 1: Structural Segmentation, RCE/HTML Guards & Orphan Detection (exit 2)
     # ==================================================================
+    if EXECUTABLE_FENCE_RE.search(deliv_body):
+        raise CompilerAbortError(
+            "PASADA 1 FALLIDA — Celdas de código ejecutable Quarto (```{python}, ```{r}, etc.) están estrictamente prohibidas en entregables.",
+            pass_number=1,
+            exit_code=2,
+        )
+    if DANGEROUS_RAW_HTML_RE.search(deliv_body):
+        raise CompilerAbortError(
+            "PASADA 1 FALLIDA — Etiquetas HTML crudas activas (<script>, <img>, <iframe>, <svg>, etc.) están prohibidas en entregables.",
+            pass_number=1,
+            exit_code=2,
+        )
+
     blocks = _split_markdown_blocks(deliv_body)
     block_findings_map: dict[int, list[str]] = {}
     orphan_blocks: list[str] = []
@@ -338,6 +385,8 @@ def compile_deliverable(
 
     all_referenced_fids = sorted({fid for fids in block_findings_map.values() for fid in fids})
     loaded_findings: dict[str, tuple[FindingContract, str]] = {}
+    finding_allowed_numbers: dict[str, set[str]] = {}
+    brief_numbers = _extract_numeric_tokens(brief_raw)
     pass2_errors: list[str] = []
 
     for fid in all_referenced_fids:
@@ -348,8 +397,9 @@ def compile_deliverable(
             continue
 
         try:
+            h_raw = h_path.read_text(encoding="utf-8")
             f_obj, _, f_body = validate_artifact_content(
-                h_path.read_text(encoding="utf-8"),
+                h_raw,
                 suffix=".md",
                 expected_tipo="hallazgo",
             )
@@ -381,6 +431,24 @@ def compile_deliverable(
             continue
 
         loaded_findings[fid] = (f_obj, f_body)
+
+        allowed_nums = set(brief_numbers)
+        allowed_nums.update(_extract_numeric_tokens(f_obj.afirmacion_corta))
+        allowed_nums.update(_extract_numeric_tokens(f_body))
+        allowed_nums.update(_extract_numeric_tokens(json.dumps(f_obj.valores_anclados)))
+        for ev_ref in f_obj.sustento_evidencia:
+            try:
+                ev_p = resolve_artifact_by_id(paths, engagement_id, ev_ref)
+                allowed_nums.update(_extract_numeric_tokens(ev_p.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                pass
+        for der_ref in f_obj.sustento_derivaciones:
+            try:
+                der_p = resolve_artifact_by_id(paths, engagement_id, der_ref)
+                allowed_nums.update(_extract_numeric_tokens(der_p.read_text(encoding="utf-8")))
+            except FileNotFoundError:
+                pass
+        finding_allowed_numbers[fid] = allowed_nums
 
     # Verify dominios_bloqueantes coverage
     if brief_obj.dominios_bloqueantes:
@@ -442,6 +510,27 @@ def compile_deliverable(
     for idx, block in enumerate(blocks):
         fids = block_findings_map.get(idx, [])
         interpolated_derivs: list[str] = []
+
+        # High #8: Verify that any quantitative metrics written directly in prose (outside {{...}} and ![[...]])
+        # are anchored in the cited Findings, Derivations, Evidence, or Brief.
+        if rigor in ("L3", "L4") and fids:
+            prose_without_placeholders = INTERPOLATION_RE.sub("", block)
+            prose_without_placeholders = TRANSCLUSION_RE.sub("", prose_without_placeholders)
+            prose_without_placeholders = SUSTENTO_COMMENT_RE.sub("", prose_without_placeholders)
+            prose_without_placeholders = WIKILINK_INLINE_RE.sub("", prose_without_placeholders)
+            allowed_block_nums: set[str] = set()
+            for fid in fids:
+                allowed_block_nums.update(finding_allowed_numbers.get(fid, set()))
+            for m_quant in PROSE_QUANT_METRIC_RE.finditer(prose_without_placeholders):
+                phrase = m_quant.group(0)
+                num_tokens = _extract_numeric_tokens(phrase)
+                if num_tokens and not (num_tokens & allowed_block_nums):
+                    raise CompilerAbortError(
+                        f"PASADA 3 FALLIDA — Cifra cuantitativa en prosa sin anclaje verificable ({phrase!r} en Bloque #{idx + 1}): "
+                        f"no coincide con {{D-XX.clave}} ni con el sustento de {fids}.",
+                        pass_number=3,
+                        exit_code=4,
+                    )
 
         # 3a. Expand ![[H-XX#Sección]] transclusions
         def _replace_transclusion(match: re.Match[str]) -> str:
@@ -528,6 +617,13 @@ def compile_deliverable(
         if not cleaned:
             continue
 
+        if EXECUTABLE_FENCE_RE.search(cleaned) or DANGEROUS_RAW_HTML_RE.search(cleaned):
+            raise CompilerAbortError(
+                f"PASADA 4 FALLIDA — Contenido transcluido contiene código ejecutable Quarto o HTML inseguro en Bloque #{idx + 1}.",
+                pass_number=4,
+                exit_code=4,
+            )
+
         block_fn_nums: list[int] = []
         if fids:
             ranks: list[int] = []
@@ -552,6 +648,26 @@ def compile_deliverable(
 
             min_rank = min(ranks)
             ceiling = RANK_TO_EPISTEMIC[min_rank]
+            if rigor in ("L3", "L4"):
+                if UNCONDITIONED_GUARANTEE_RE.search(cleaned):
+                    raise CompilerAbortError(
+                        f"PASADA 4 FALLIDA — Violación de techo epistémico ({ceiling!r}) en Bloque #{idx + 1}: "
+                        "lenguaje de garantía absoluta o libre de riesgo prohibido en entregables L3/L4.",
+                        pass_number=4,
+                        exit_code=4,
+                    )
+                if min_rank <= EPISTEMIC_RANK["inferencia_condicionada"] and re.search(
+                    r"\b(demuestra\s+inequívocamente|prueba\s+definitivamente|garantiza\b)",
+                    cleaned,
+                    re.IGNORECASE,
+                ):
+                    raise CompilerAbortError(
+                        f"PASADA 4 FALLIDA — Inflación epistémica en Bloque #{idx + 1}: la prosa afirma certeza "
+                        f"categórica por encima de techo_fuerza_afirmacion={ceiling!r}.",
+                        pass_number=4,
+                        exit_code=4,
+                    )
+
             traceability_entries.append(
                 {
                     "bloque_indice": len(traceability_entries) + 1,
@@ -563,6 +679,7 @@ def compile_deliverable(
                 }
             )
 
+        html_safe_cleaned = RAW_HTML_TAG_RE.sub(lambda m: html.escape(m.group(0)), cleaned)
         if block_fn_nums and not cleaned.startswith(("#", "|", "```", "-", "*", "1.")):
             md_refs = "".join(f"[^{n}]" for n in block_fn_nums)
             html_refs = "".join(
@@ -570,10 +687,10 @@ def compile_deliverable(
                 for n in block_fn_nums
             )
             rendered_md_blocks.append(f"{cleaned} {md_refs}")
-            rendered_html_blocks.append(f"{cleaned} {html_refs}")
+            rendered_html_blocks.append(f"{html_safe_cleaned} {html_refs}")
         else:
             rendered_md_blocks.append(cleaned)
-            rendered_html_blocks.append(cleaned)
+            rendered_html_blocks.append(html_safe_cleaned)
 
     # Append verifiable footnotes section to Markdown
     if footnote_records:
@@ -683,6 +800,8 @@ def compile_deliverable(
             f'title: "{title}"\n'
             f'date: "{brief_obj.fecha.isoformat()}"\n'
             "lang: es\n"
+            "execute:\n"
+            "  enabled: false\n"
             f"format:\n  {fmt_lower}:\n    toc: true\n"
             "---\n\n"
         )
@@ -691,7 +810,7 @@ def compile_deliverable(
         quarto_bin = shutil.which("quarto")
         if quarto_bin:
             proc = subprocess.run(
-                [quarto_bin, "render", str(qmd_path), "--to", fmt_lower],
+                [quarto_bin, "render", str(qmd_path), "--to", fmt_lower, "--no-execute"],
                 cwd=out_dir,
                 capture_output=True,
                 text=True,
