@@ -546,17 +546,21 @@ def validate_artifact_content(
     return validated, metadata, body
 
 
-def compute_finding_substantive_sha256(content_or_path: str | Path) -> str:
+def compute_finding_substantive_sha256(
+    content_or_path_or_meta: str | Path | dict[str, Any],
+    body: str | None = None,
+) -> str:
     """Compute SHA-256 of a Finding note's substantive content (excluding kernel-managed estado_qa)."""
-    if isinstance(content_or_path, Path):
-        raw_text = content_or_path.read_text(encoding="utf-8")
-        suffix = content_or_path.suffix
+    if isinstance(content_or_path_or_meta, dict):
+        meta = content_or_path_or_meta
+        body_str = body or ""
+    elif isinstance(content_or_path_or_meta, Path):
+        raw_text = content_or_path_or_meta.read_text(encoding="utf-8")
+        meta, body_str = parse_raw_artifact(raw_text, suffix=content_or_path_or_meta.suffix)
     else:
-        raw_text = content_or_path
-        suffix = ".md"
-    meta, body = parse_raw_artifact(raw_text, suffix=suffix)
+        meta, body_str = parse_raw_artifact(content_or_path_or_meta, suffix=".md")
     canonical_meta = {k: v for k, v in meta.items() if k != "estado_qa"}
-    canonical = dump_markdown_note(canonical_meta, body).replace("\r\n", "\n")
+    canonical = dump_markdown_note(canonical_meta, body_str).replace("\r\n", "\n")
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

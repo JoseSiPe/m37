@@ -377,7 +377,6 @@ def test_full_runner_state_machine_r1_reject_to_r2_accept_and_close_leak_guard(t
     assert v_bless.is_file()
 
 
-@pytest.mark.skipif(importlib.util.find_spec("duckdb") is None, reason="DuckDB opcional no instalado")
 def test_anillo_1_bitemporal_duckdb_reindex_and_5_graph_queries(tmp_path: Path) -> None:
     ws = init_workspace(tmp_path / "graph_ws")
     reindex_file = get_core_repo_root() / "extensions" / "mcp_episodic_graph" / "reindex.py"
@@ -410,7 +409,6 @@ def test_anillo_1_bitemporal_duckdb_reindex_and_5_graph_queries(tmp_path: Path) 
     assert isinstance(mod.query_cuellos_presupuesto_arquetipo(db_path), list)
 
 
-@pytest.mark.skipif(importlib.util.find_spec("duckdb") is None, reason="DuckDB opcional no instalado")
 def test_typer_cli_commands_and_mcp_server_jsonrpc(tmp_path: Path) -> None:
     from typer.testing import CliRunner
     from m37.cli import app

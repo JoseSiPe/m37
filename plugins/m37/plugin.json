@@ -1,0 +1,18 @@
+{
+  "name": "m37",
+  "displayName": "M37 (Move 37) Epistemic Microkernel",
+  "version": "0.2.0",
+  "description": "Microkernel multiagente determinista sobre Obsidian/Markdown Vault: contratos Pydantic estrictos, sandbox de cómputo, QA Ciego aislado, compilador de 5 pasadas y grafo bitemporal con $0 de costo extra de API.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "José Carlos Sierra",
+    "url": "https://github.com/JoseSiPe"
+  },
+  "homepage": "https://github.com/JoseSiPe/m37",
+  "repository": "https://github.com/JoseSiPe/m37",
+  "suggestedPrompts": [
+    "Inspecciona el estado del workspace M37 y compila el encargo DEMO-01_entrada-mercado",
+    "Crea y planifica un nuevo encargo M37 de rigor L3 y ejecuta sus nodos con QA Ciego",
+    "Consulta el linaje bitemporal y las fuentes por vencer del Vault M37"
+  ]
+}

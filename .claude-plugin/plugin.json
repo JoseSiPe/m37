@@ -1,0 +1,20 @@
+{
+  "name": "m37",
+  "version": "0.2.0",
+  "description": "M37 (Move 37) — Task-agnostic epistemic microkernel over Markdown/Obsidian Vault with Phase A verification, isolated Blind QA subagent, and 5-pass deliverable compiler.",
+  "author": {
+    "name": "José Carlos Sierra",
+    "url": "https://github.com/JoseSiPe"
+  },
+  "homepage": "https://github.com/JoseSiPe/m37",
+  "repository": "https://github.com/JoseSiPe/m37",
+  "license": "MIT",
+  "keywords": [
+    "m37",
+    "move-37",
+    "epistemic-kernel",
+    "obsidian-vault",
+    "blind-qa",
+    "mcp"
+  ]
+}

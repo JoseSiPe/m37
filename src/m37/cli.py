@@ -547,6 +547,7 @@ def generate_plan_from_archetype(
     orchestrator: str | None = None,
     approve_gate_1: bool = False,
     approve_gate_2: bool = False,
+    harness_mode: bool = False,
     env: Mapping[str, str] | None = None,
     completion_fn: Callable[..., Any] | None = None,
 ) -> tuple[Path, list[Path]]:
@@ -592,9 +593,12 @@ def generate_plan_from_archetype(
 
     catalog = load_model_catalog(paths.modelos_yaml_path())
     active = filter_active_models(catalog, effective_env)
+    if not active and harness_mode:
+        # Host-harness subscription mode (Antigravity, Claude Code, Codex CLI): use catalog profiles without external API keys
+        active = dict(catalog.modelos)
     if not active:
         raise RoutingGuardrailError(
-            "Ningún modelo activo en Modelos.yaml. Configura al menos una API key en .env antes de planificar."
+            "Ningún modelo activo en Modelos.yaml. Configura al menos una API key en .env o usa --harness para operar con tu plan actual."
         )
 
     arq_contract = load_archetype_plugin(paths, archetype_name)
@@ -1709,6 +1713,11 @@ def cli_plan(
     ),
     approve_gate_1: bool = typer.Option(False, "--approve-gate-1", help="Aprobar Puerta 1 automáticamente."),
     approve_gate_2: bool = typer.Option(False, "--approve-gate-2", help="Aprobar Puerta 2 automáticamente."),
+    harness: bool = typer.Option(
+        False,
+        "--harness",
+        help="Planificar en modo nativo del harness (Antigravity, Claude Code o Codex) sin requerir API keys en .env.",
+    ),
     vault: Path | None = typer.Option(None, "--vault"),
 ) -> None:
     """Genera 01_Plan.md y Nodos/N-*.md desde el plugin declarativo Arquetipos/*.md y el router SPEC-02."""
@@ -1721,6 +1730,7 @@ def cli_plan(
             approve_gate_1=approve_gate_1,
             approve_gate_2=approve_gate_2,
             orchestrator=orchestrator,
+            harness_mode=harness,
         )
     except RoutingGuardrailError as exc:
         console.print(f"[bold red]PLANIFICACIÓN BLOQUEADA:[/bold red] {exc}")
@@ -1860,34 +1870,99 @@ def cli_close(
 def cli_reindex(
     vault: Path | None = typer.Option(None, "--vault"),
 ) -> None:
-    """Proyecta el Vault y episodios.jsonl hacia el índice analítico bitemporal DuckDB (0 tokens LLM)."""
+    """Proyecta el Vault y episodios.jsonl hacia el índice analítico bitemporal DuckDB o JSON fallback (0 tokens LLM)."""
     paths = resolve_workspace_paths(vault)
     reindex_script = get_core_repo_root() / "extensions" / "mcp_episodic_graph" / "reindex.py"
     if not reindex_script.is_file():
         console.print(f"[red]No se encontró la extensión de grafo en {reindex_script}[/red]")
         raise typer.Exit(code=1)
 
-    if importlib.util.find_spec("duckdb") is None:
-        console.print(
-            "[yellow]DuckDB no está instalado (entorno Bare Bones).[/yellow] "
-            "Instala el perfil Full con: pip install -e '.[full]'"
-        )
-        raise typer.Exit(code=0)
-
     spec = importlib.util.spec_from_file_location("m37_ext_reindex", reindex_script)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     stats = mod.reindex_vault_to_duckdb(paths)
+    backend_label = "DuckDB" if importlib.util.find_spec("duckdb") is not None else "JSON Bitemporal Fallback (Bare Bones)"
     console.print(
         Panel(
-            f"Base DuckDB: [bold]{paths.duckdb_index_path()}[/bold]\n"
+            f"Motor de índice: [bold]{backend_label}[/bold] ({paths.duckdb_index_path()})\n"
             f"Artefactos indexados: {stats['artefactos']} · Aristas linaje: {stats['aristas']} · "
             f"Eventos episódicos: {stats['episodios']}",
             title="M37 Reindex Bitemporal Completado (0 tokens LLM)",
             border_style="green",
         )
     )
+
+
+@app.command("mcp-serve")
+def cli_mcp_serve(
+    vault: Path | None = typer.Option(None, "--vault", help="Ruta por defecto al workspace/vault M37."),
+) -> None:
+    """Inicia el servidor MCP universal de M37 (stdio JSON-RPC 2.0) para Antigravity, Claude Code o Codex CLI."""
+    from m37.mcp_server import run_stdio_server
+
+    run_stdio_server(vault=str(vault) if vault else None)
+
+
+plugin_app = typer.Typer(
+    name="plugin",
+    help="Instala y verifica el plugin universal multi-harness de M37 (Antigravity, Claude Code y OpenAI Codex CLI).",
+    no_args_is_help=True,
+)
+app.add_typer(plugin_app, name="plugin")
+
+
+@plugin_app.command("install")
+def cli_plugin_install(
+    target: str = typer.Option(
+        "all",
+        "--target",
+        "-t",
+        help="Harness destino: all, antigravity, claude o codex.",
+    ),
+    scope: str = typer.Option(
+        "both",
+        "--scope",
+        "-s",
+        help="Alcance de instalación: global (~/.gemini, ~/.claude, ~/.codex), workspace o both.",
+    ),
+    workspace: Path | None = typer.Option(
+        None,
+        "--workspace",
+        "-w",
+        help="Directorio del repositorio/workspace donde escribir manifiestos locales.",
+    ),
+) -> None:
+    """Instala el plugin, skills, subagente m37-qa-ciego, reglas y servidor MCP m37-kernel en Antigravity, Claude Code y Codex CLI."""
+    from m37.harness import install_harness_plugin
+
+    res = install_harness_plugin(target=target, scope=scope, workspace_dir=workspace)
+    table = Table(title=f"M37 v{res['version']} — Instalación Multi-Harness ({res['target']} / {res['scope']})")
+    table.add_column("Harness", style="cyan", no_wrap=True)
+    table.add_column("Archivos Instalados", style="green")
+    for harness_name, files in res["installed"].items():
+        if files:
+            table.add_row(harness_name, f"{len(files)} archivos configurados")
+    console.print(table)
+
+
+@plugin_app.command("status")
+def cli_plugin_status(
+    workspace: Path | None = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """Verifica el estado de instalación del plugin M37 en Antigravity, Claude Code y OpenAI Codex CLI."""
+    from m37.harness import inspect_harness_status
+
+    status = inspect_harness_status(workspace_dir=workspace)
+    table = Table(title="M37 — Estado del Plugin Multi-Harness")
+    table.add_column("Harness", style="cyan", no_wrap=True)
+    table.add_column("Global (~/)", style="white")
+    table.add_column("Workspace (Repo)", style="white")
+    for h_name, info in status.items():
+        g_str = "[green]Instalado[/green]" if info["global"] else "[yellow]No instalado[/yellow]"
+        w_str = "[green]Instalado[/green]" if info["workspace"] else "[yellow]No instalado[/yellow]"
+        table.add_row(h_name, g_str, w_str)
+    console.print(table)
 
 
 if __name__ == "__main__":

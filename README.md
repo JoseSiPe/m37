@@ -39,7 +39,23 @@ Copy-Item .env.example .env
 Comandos adicionales de gobernanza:
 * `m37 quarantine <ID_ARTEFACTO> --encargo <ID> --reason "..."` (o `--motivo`) — Cuarentena física sin borrar pista de auditoría.
 * `m37 bless <ID_HALLAZGO> --encargo <ID> --reason "..."` (o `--justificacion`) — Aprobación humana auditable tras inspección o re-sellado.
-* `m37 reindex` — Reconstruye `vault/.indice/grafo.duckdb` bitemporal (Modo `Full`, 0 llamadas LLM).
+* `m37 reindex` — Reconstruye `vault/.indice/grafo.duckdb` (o índice bitemporal JSON en modo *Bare Bones*, 0 llamadas LLM).
+
+## Plugin Multi-Harness Universal (`Antigravity`, `Claude Code`, `OpenAI Codex CLI`)
+
+Puedes ejecutar **M37** directamente sobre tu plan topado actual (**\$0 en llaves API adicionales**) instalando el plugin universal y el servidor MCP `m37-kernel`:
+
+```powershell
+# Instala globalmente (~/.gemini, ~/.claude, ~/.codex) y en el repositorio actual
+.\.venv\Scripts\m37 plugin install --target all --scope both
+
+# Verifica el estado en los 3 harnesses
+.\.venv\Scripts\m37 plugin status
+```
+
+* **Google Antigravity:** Instala `~/.gemini/config/plugins/m37/` (`plugin.json`, `mcp_config.json`, `rules/AGENTS.md`, subagente `agents/m37-qa-ciego.md` y `skills/m37/SKILL.md`).
+* **Claude Code:** Instala `.claude-plugin/plugin.json`, `.mcp.json`, `CLAUDE.md`, subagente aislado `.claude/agents/m37-qa-ciego.md`, skill `.claude/skills/m37/SKILL.md` y comandos `/m37`, `/m37-qa`, `/m37-compile`.
+* **OpenAI Codex CLI:** Instala `AGENTS.md`, `.agents/skills/m37/SKILL.md` y registra `[mcp_servers.m37_kernel]` en `~/.codex/config.toml`.
 
 ## Transparencia, Referencias y Licencia
 

@@ -1,0 +1,6 @@
+# >>> M37-KERNEL-MCP-START >>>
+[mcp_servers.m37_kernel]
+command = "python"
+args = ["-m", "m37.mcp_server"]
+env = { PYTHONUTF8 = "1" }
+# <<< M37-KERNEL-MCP-END <<<

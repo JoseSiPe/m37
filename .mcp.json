@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "m37-kernel": {
+      "command": "python",
+      "args": [
+        "-m",
+        "m37.mcp_server"
+      ],
+      "env": {
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

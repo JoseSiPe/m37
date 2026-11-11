@@ -38,6 +38,7 @@ dev = [
 
 [project.scripts]
 m37 = "m37.cli:app"
+m37-mcp = "m37.mcp_server:run_stdio_server"
 
 [tool.setuptools.packages.find]
 where = ["src"]
