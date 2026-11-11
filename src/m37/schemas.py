@@ -101,6 +101,9 @@ class BriefContract(StrictContractModel):
     dominios_involucrados: list[str] = Field(min_length=1)
     dominios_bloqueantes: list[str] = Field(default_factory=list)
     hipotesis_a_falsear: list[str] = Field(default_factory=list)
+    # A3: dominios que `web_fetch_clean` puede consultar. Vive en el Brief para quedar cubierto por el hash de Puerta 1
+    # (ningún agente puede editarlo). Obligatorio para usar web_fetch_clean en L3/L4.
+    dominios_web_permitidos: list[str] = Field(default_factory=list)
     puerta_1_aprobada: bool = False
     puerta_1_sha256: str | None = None
     puerta_1_aprobado_por: str | None = None
@@ -111,6 +114,20 @@ class BriefContract(StrictContractModel):
         if self.nivel_rigor in ("L2", "L3", "L4") and len(self.hipotesis_a_falsear) < 1:
             raise ValueError("Encargos L2-L4 requieren al menos 1 hipótesis inicial a falsear.")
         return self
+
+    @field_validator("dominios_web_permitidos")
+    @classmethod
+    def _validar_dominios_web(cls, v: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in v:
+            dom = str(raw).strip().lower().lstrip(".")
+            if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", dom):
+                raise ValueError(
+                    f"Dominio inválido en dominios_web_permitidos ({raw!r}): usa nombres de host como 'inegi.org.mx', "
+                    "sin esquema, ruta ni comodines."
+                )
+            cleaned.append(dom)
+        return cleaned
 
 
 # 2. CONTRATO DE PLAN Y DE NODO (01_Plan.md y Nodos/N-XX.md)
@@ -146,6 +163,8 @@ class PlanContract(StrictContractModel):
     arquetipo_base: str
     nodos: list[str] = Field(min_length=1)
     presupuesto_total_estimado_usd: float = Field(ge=0.0)
+    # NA4: "harness" = los nodos los ejecuta el agente anfitrión vía MCP; el kernel no enruta ni conoce el modelo real.
+    modo_ejecucion: Literal["api", "harness"] = "api"
     puerta_2_aprobada: bool = False
     puerta_2_sha256: str | None = None
     puerta_2_aprobado_por: str | None = None
@@ -266,6 +285,8 @@ class EvidenceContract(StrictContractModel):
     localizador_verificable: str = Field(min_length=3)
     snapshot_local: str | None = None
     hash_snapshot: str | None = None
+    # NC2: procedencia del snapshot, estampada por el kernel desde el registro de referencias/ (nunca por el agente).
+    origen_snapshot: Literal["kernel_fetch", "ingesta_humana", "demo_simulado"] | None = None
     fiabilidad: Literal["alta", "media", "baja"]
     cita_verificada: bool = False
     invalidada: bool = False
@@ -278,7 +299,13 @@ class EvidenceContract(StrictContractModel):
         return self
 
 
-import hashlib
+
+
+NUMERIC_LIKE_STRING_RE = re.compile(
+    r"^\s*[-+~≈<>]?\s*(?:USD|MXN|EUR|US\$|\$|€)?\s*\d[\d.,]*\s*"
+    r"(?:%|x|pp|pb|k|m|mm|b|bn|m[dn]p|musd|usd|mxn|eur|millones|mil|meses|años|dias|días)?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _contains_numeric_value(val: Any) -> bool:
@@ -286,6 +313,9 @@ def _contains_numeric_value(val: Any) -> bool:
         return False
     if isinstance(val, (int, float)):
         return True
+    if isinstance(val, str):
+        # A2: "37%", "1.60", "USD 12M" son cifras aunque vengan entre comillas.
+        return bool(NUMERIC_LIKE_STRING_RE.match(val))
     if isinstance(val, dict):
         return any(_contains_numeric_value(v) for v in val.values())
     if isinstance(val, (list, tuple)):
@@ -590,7 +620,12 @@ def compute_plan_dag_sha256(
     body: str | None = None,
     node_paths: list[Path] | None = None,
 ) -> str:
-    """Compute SHA-256 over 01_Plan.md + all Nodos/N-*.md substantive definitions (excluding runtime state/rondas_qa)."""
+    """Compute SHA-256 over 01_Plan.md + all Nodos/N-*.md definitions.
+
+    Only kernel-managed runtime state (`estado`, `rondas_qa`) is excluded. Model routing, budgets, turn limits and
+    `depende_de` ARE covered (A4): changing who executes, who audits, how much may be spent or the DAG order after
+    approval invalidates Puerta 2.
+    """
     if isinstance(engagement_dir_or_meta, dict):
         p_meta = engagement_dir_or_meta
         p_body = body or ""
@@ -622,7 +657,7 @@ def compute_plan_dag_sha256(
             chunks.append(f"NODE:{bare_nid}:MISSING")
             continue
         n_meta, n_body = parse_raw_artifact(npath.read_text(encoding="utf-8"), suffix=".md")
-        excluded_node = {"estado", "rondas_qa", "enrutamiento_modelo", "depende_de"}
+        excluded_node = {"estado", "rondas_qa"}
         canon_node = dump_markdown_note({k: v for k, v in n_meta.items() if k not in excluded_node}, n_body).replace(
             "\r\n", "\n"
         )

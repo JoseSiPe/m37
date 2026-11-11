@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,90 +21,86 @@ M37_LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" 
 </svg>
 """
 
-M37_RULES_MARKDOWN = """# M37 (Move 37) — Reglas Epistémicas y de Gobernanza Multi-Harness
+M37_RULES_MARKDOWN = """# M37 (Move 37) — Reglas de operación en modo harness
 
-Cuando operes sobre un workspace o Vault de **M37 (Move 37)** (`vault/20_Encargos/`, `00_Brief.md`, `01_Plan.md`):
+Aplican cuando operes sobre un workspace o Vault de **M37 (Move 37)** (`vault/20_Encargos/`, `00_Brief.md`, `01_Plan.md`).
 
-1. **Cero Escritura Cruda sin Guardián (`ExecutionGuard`)**:
-   - Todo artefacto de M37 (`00_Brief.md`, `01_Plan.md`, `Nodos/N-*.md`, `Evidencia_Interna/EI-*.md`, `30_Evidencia_Publica/E-*.md`, `Derivaciones/D-*.json`, `Hallazgos/H-*.md`, `QA/V-*.md`, `Entregables/*.md`) DEBE escribirse a través de la herramienta MCP `m37_write_artifact` o `m37_record_qa_verdict` (o validarse con `m37 verify`).
-   - Todos los contratos Pydantic v2 aplican `extra="forbid"`: no inventes llaves YAML fuera del esquema oficial.
+## Qué garantiza el kernel aquí y qué no
 
-2. **Ejecución con Costo API Extra \\$0 (Modo Nativo del Harness)**:
-   - Usa tu propio razonamiento dentro del harness anfitrión (**Antigravity**, **Claude Code** o **Codex CLI**) en lugar de invocar APIs pagadas externas cuando el usuario opere bajo su suscripción actual.
-   - Planifica con `m37_plan_engagement` (0 tokens externos).
+En modo harness tú tienes herramientas propias de archivos y terminal, así que el kernel **no** media todo lo que haces: solo gobierna lo que pasa por el servidor MCP `m37-kernel`, y vuelve a comprobar desde disco en `m37 verify` y `m37 compile`. Lo que el kernel no puede ver, no lo certifica.
 
-3. **Aislamiento Estricto en QA Ciego (`m37-qa-ciego`)**:
-   - Nunca auto-apruebes un Hallazgo `L3` o `L4` en el mismo hilo de razonamiento que lo redactó.
-   - Ejecuta primero `m37_prepare_blind_qa` (que corre Fase A mecánica y re-ejecuta scripts en el sandbox).
-   - Delega la auditoría al subagente aislado `m37-qa-ciego` pasándole **únicamente** los archivos de `allowlist_files`. El subagente tiene prohibido leer `01_Plan.md`, `Nodos/N-*.md`, `Entregables/*.md` o `90_Bitacora/`.
+## Reglas
 
-4. **Anclaje Cuantitativo y Techo Epistémico**:
-   - Toda cifra cuantitativa (`%`, `USD`, `VAN`, `TIR`, meses) en un entregable debe provenir de `valores_anclados` de un Hallazgo aceptado o del `00_Brief.md`.
-   - Toda cita textual (`cita_verificada: true`) con `snapshot_local` debe existir literalmente en `referencias/`.
+1. **Escribe artefactos solo por MCP.** Todo `E-*`, `EI-*`, `D-*`, `H-*` y `Entregables/*.md` se escribe con `m37_write_artifact` bajo el `node_id` del nodo aprobado que corresponde. No edites esos archivos con herramientas nativas: perderían los sellos del kernel y `verify` los rechazará.
+
+2. **Las puertas son de la persona.** No existe herramienta para aprobar la Puerta 1 ni la Puerta 2. Cuando una herramienta responda con `siguiente_paso_humano`, detente y pide a la persona que ejecute `m37 approve <encargo> --gate N` en su terminal. No ejecutes `m37 approve`, `m37 bless` ni `m37 ingest` por tu cuenta, ni edites `puerta_*` en el Markdown: sin sello no hay puerta.
+
+3. **Las fuentes no se fabrican.** Un snapshot citable solo entra por `web_fetch_clean` (lo descarga el kernel) o por `m37 ingest` (lo registra la persona). Un archivo que escribas en `referencias/` no es una fuente y `cita_verificada` quedará en `false`.
+
+4. **El QA del harness es consultivo en L3/L4.** Puedes delegar una revisión al subagente `m37-qa-ciego` y registrarla con `m37_record_qa_verdict`, pero queda marcada `revision_ciega_verificada: false`. Para que un Hallazgo L3/L4 quede aprobado hace falta `m37_run_kernel_qa` (el kernel llama por API a un modelo de otra familia) o `m37 bless` de la persona. Nunca registres un veredicto sobre un Hallazgo en el mismo hilo que lo redactó.
+
+5. **Un cliente por workspace.** No leas ni listes `10_Clientes/`, `20_Encargos/`, `datos/`, `analisis/`, `codigo/` o `referencias/` de un encargo distinto al que estás trabajando.
+
+6. **Cifras ancladas.** Toda cifra en un entregable debe venir de `{{D-XX.clave}}`, de `valores_anclados`/`salidas` del sustento citado o del `00_Brief.md`. El compilador aborta si no es así.
 """
 
 M37_SKILL_MARKDOWN = """---
 name: m37
-description: Ejecuta el microkernel epistémico M37 (Move 37) sobre un Obsidian/Markdown Vault con verificación mecánica Fase A, sandbox determinista, QA Ciego aislado y compilador de 5 pasadas en Antigravity, Claude Code o Codex CLI (sin costo extra de API). Úsalo cuando el usuario mencione M37, Move 37, encargos L1-L4, 00_Brief.md, 01_Plan.md, Hallazgos H-*, Derivaciones D-*, QA Ciego o compilación de entregables auditables.
+description: Opera un encargo de M37 (Move 37) sobre un Vault Markdown desde Antigravity, Claude Code o Codex CLI usando el servidor MCP m37-kernel. Úsalo cuando el usuario mencione M37, Move 37, encargos L1-L4, 00_Brief.md, 01_Plan.md, Hallazgos H-*, Derivaciones D-*, QA ciego o compilación de entregables.
 ---
 
-# M37 (Move 37) — Universal Multi-Harness Skill (`v0.2.0`)
+# M37 (Move 37) — Skill para harness (`v0.2.0`)
 
-Este skill permite operar el ciclo completo de **M37 (Move 37)** usando directamente la suscripción del harness anfitrión (**Antigravity**, **Claude Code** o **OpenAI Codex CLI**) con **\\$0 de gasto en APIs externas**, manteniendo el 100% de las garantías criptográficas y epistémicas del microkernel Python.
+Permite trabajar un encargo de M37 con el modelo del harness anfitrión (Antigravity, Claude Code o Codex CLI) sin llaves API para los nodos productivos.
 
-## Herramientas MCP Disponibles (`m37-kernel`)
+## Qué se conserva y qué no en este modo
 
-Si el servidor MCP `m37-kernel` está activo, dispones de 12 herramientas deterministas:
+| Garantía | En modo harness |
+|---|---|
+| Contratos Pydantic, linaje por hash, re-ejecución de scripts, veredicto ligado al contenido | Sí: `verify` y `compile` lo recalculan desde disco |
+| Puertas humanas 1 y 2 | Sí, si la persona ejecuta `m37 approve`; no hay herramienta MCP que apruebe |
+| Autenticidad del snapshot citado | Sí, solo vía `web_fetch_clean` o `m37 ingest` |
+| QA ciego de otra familia | Solo con `m37_run_kernel_qa` (API) o `m37 bless` (persona) |
+| Separación de perfiles y aislamiento entre clientes | Solo para lo que pasa por MCP; usa un workspace por cliente |
 
-1. `m37_workspace_status`: Inspecciona encargos, firmas SHA-256 de Puerta 1 y Puerta 2, nodos DAG y hallazgos.
-2. `m37_init_or_new_engagement`: Inicializa un workspace M37 (`init_workspace`) y/o crea un encargo (`00_Brief.md`).
-3. `m37_plan_engagement`: Compila `01_Plan.md` y `Nodos/N-*.md` desde un Arquetipo declarativo (`ARQ_Diagnostico-Cualitativo`, `ARQ_Modelo-Cuantitativo`, `ARQ_Desarrollo-Software-SDD`) en modo nativo del harness.
-4. `m37_write_artifact`: Escribe notas o scripts y ejecuta código en el sandbox restringido a través de `ExecutionGuard` (`write_note`, `write_script`, `run_python_sandbox`, `run_verification_sandbox`, `web_fetch_clean`).
-5. `m37_prepare_blind_qa`: Ejecuta Fase A mecánica sobre un Hallazgo (`H-*`) y devuelve la lista blanca (`allowlist_files`) y el prompt aislado para el subagente `m37-qa-ciego`.
-6. `m37_record_qa_verdict`: Registra el veredicto (`QA/V-*.md`) ligado al `sha256_hallazgo_auditado`.
-7. `m37_verify_and_compile`: Re-ejecuta scripts en sandbox (`Fase A`) y ejecuta el compilador determinista de 5 pasadas (`HTML`, `Markdown`, `mapa_trazabilidad.json`).
-8. **Consultas Bitemporales del Grafo (0 tokens LLM)**:
-   - `fuentes_por_vencer`
-   - `desempeno_empirico_modelos`
-   - `patrones_rechazo_qa`
-   - `cuellos_presupuesto_arquetipo`
-   - `linaje_artefacto`
+## Herramientas MCP (`m37-kernel`)
 
-*(Si en algún entorno prefieres usar la CLI directamente, todos los pasos equivalen a `m37 init`, `m37 new`, `m37 plan --harness`, `m37 verify --rerun`, `m37 compile` y `m37 close`).*
+1. `m37_workspace_status`: encargos, validez de Puertas 1 y 2, nodos y hallazgos.
+2. `m37_init_or_new_engagement`: inicializa el workspace y/o crea un encargo con su `00_Brief.md`.
+3. `m37_plan_engagement`: genera `01_Plan.md` y `Nodos/N-*.md` desde un arquetipo (`ARQ_Diagnostico-Cualitativo`, `ARQ_Analisis-Cuantitativo`, `ARQ_Construccion-Software-SDD`).
+4. `m37_write_artifact`: acciones bajo `ExecutionGuard` con el perfil del nodo indicado (`write_note`, `write_script`, `write_code_file`, `run_python_sandbox`, `run_verification_sandbox`, `web_fetch_clean`).
+5. `m37_prepare_blind_qa`: Fase A mecánica y lista de archivos para el subagente `m37-qa-ciego`.
+6. `m37_record_qa_verdict`: registra el veredicto del subagente, marcado como no atestiguado.
+7. `m37_run_kernel_qa`: QA ciego ejecutado por el kernel vía API con un modelo de otra familia (atestiguado).
+8. `m37_verify_and_compile`: Fase A completa y compilador de 5 pasadas.
+9. Consultas del grafo: `fuentes_por_vencer`, `desempeno_empirico_modelos`, `patrones_rechazo_qa`, `cuellos_presupuesto_arquetipo`, `linaje_artefacto`.
 
----
+## Flujo
 
-## Flujo Operativo Paso a Paso (Costo API Extra: \\$0)
+### Paso 1 — Brief y Puerta 1
+1. `m37_workspace_status`.
+2. Si hace falta, `m37_init_or_new_engagement(id_encargo=..., cliente=..., rigor=..., pregunta=...)`.
+3. Presenta el Brief a la persona. **Detente**: ella revisa `00_Brief.md` (incluido `dominios_web_permitidos` si habrá consulta web) y ejecuta `m37 approve <encargo> --gate 1`.
 
-### Paso 1: Inicialización y Puerta 1 (`00_Brief.md`)
-1. Llama a `m37_workspace_status` para inspeccionar el workspace actual.
-2. Si el usuario pide crear un encargo nuevo, llama a `m37_init_or_new_engagement(id_encargo=..., cliente=..., rigor=..., pregunta=...)`.
-3. Presenta el resumen del `00_Brief.md` al usuario para confirmar **Puerta 1** (o pasa `approve_gate_1=True` cuando el usuario lo autorice).
+### Paso 2 — Plan y Puerta 2
+1. `m37_plan_engagement(id_encargo=..., arquetipo=...)`.
+2. Presenta nodos, perfiles y dependencias. **Detente**: la persona ejecuta `m37 approve <encargo> --gate 2`.
 
-### Paso 2: Planificación DAG y Puerta 2 (`01_Plan.md`)
-1. Llama a `m37_plan_engagement(id_encargo=..., arquetipo=..., approve_gate_1=True, approve_gate_2=True)`.
-2. El kernel generará `01_Plan.md` y los nodos `Nodos/N-*.md` sellando criptográficamente `puerta_1_sha256` y `puerta_2_sha256`.
+### Paso 3 — Nodos productivos (en orden topológico)
+Cada llamada a `m37_write_artifact` lleva el `node_id` del nodo que estás ejecutando; su perfil decide qué puedes escribir.
+- **Evidencia (`E-*` / `EI-*`)**: obtén la fuente con `web_fetch_clean` (devuelve `SNAPSHOT_LOCAL`) o pide a la persona `m37 ingest <archivo> --encargo <id>`. Copia en `## Extracto o referencia verificable` una cita literal entre comillas del snapshot. El kernel estampa `cita_verificada`, `hash_snapshot` y `origen_snapshot`.
+- **Derivación (`D-*`, `productor_modo: "script"`)**: escribe el script con `action="write_script"` (debe imprimir un JSON en stdout) y luego la Derivación con `action="write_note"`; el kernel ejecuta el script y sella `salidas` y `productor_sha256`. Requiere un nodo con `requiere_computo: true`.
+- **Hallazgo (`H-*`)**: `valores_anclados` debe coincidir con las `salidas` de las Derivaciones citadas.
 
-### Paso 3: Ejecución Custodiada de Nodos Productivos (`N-01`, `N-02`, ...)
-Para cada nodo en orden topológico:
-- **Evidencia (`E-*` / `EI-*`)**:
-  - Si usa `snapshot_local: "referencias/..."`, guarda primero el archivo en `referencias/` y verifica que el bloque `## Extracto o referencia verificable` contenga una cita literal exacta del snapshot antes de llamar a `m37_write_artifact(..., action="write_note")`.
-- **Derivación (`D-*` con `productor_modo: "script"`)**:
-  - Primero escribe el script Python reproducible en `analisis/<id_encargo>/<script>.py` usando `m37_write_artifact(..., action="write_script")` (el script debe imprimir un JSON a `stdout` con las métricas).
-  - Luego escribe `vault/20_Encargos/<id_encargo>/Derivaciones/D-*.json` con `m37_write_artifact(..., action="write_note")`. El kernel ejecutará automáticamente el script en el sandbox y sellará `salidas` y `productor_sha256`.
-- **Hallazgo (`H-*`)**:
-  - Escribe `vault/20_Encargos/<id_encargo>/Hallazgos/H-*.md` mediante `m37_write_artifact(..., action="write_note")` asegurándote de que cada valor de `valores_anclados` coincida exactamente con las `salidas` de las Derivaciones citadas.
+### Paso 4 — QA
+1. `m37_prepare_blind_qa(id_encargo=..., id_hallazgo=...)`; corrige si `phase_a_passed` es `false`.
+2. Opcional: delega al subagente `m37-qa-ciego` con el `subagent_prompt`; registrará su veredicto (consultivo en L3/L4).
+3. **L3/L4**: llama a `m37_run_kernel_qa(id_encargo=..., id_hallazgo=...)`. La persona declara la familia de tu modelo en `M37_HARNESS_FAMILY` (.env). Si falta esa variable o no hay API key de otra familia, **detente** y pide a la persona que la configure o que ejecute `m37 bless`.
 
-### Paso 4: Verificación Fase A + QA Ciego Aislado (`m37-qa-ciego`)
-Para todo Hallazgo en rigor `L3` o `L4`:
-1. Llama a `m37_prepare_blind_qa(id_encargo=..., id_hallazgo=..., ronda=1)`.
-2. Si `phase_a_passed` es `False`, corrige los errores mecánicos reportados antes de continuar.
-3. Si `phase_a_passed` es `True`, invoca un **subagente aislado** (`invoke_subagent` en Antigravity, subagente `m37-qa-ciego` en Claude Code, o tarea aislada en Codex) pasándole el `subagent_prompt` devuelto por `m37_prepare_blind_qa`.
-4. El subagente auditará exclusivamente los archivos en `allowlist_files` y registrará su dictamen con `m37_record_qa_verdict`.
-
-### Paso 5: Nodo Editorial y Compilador Determinista de 5 Pasadas
-1. En el nodo editorial (`Informe.md`), usa transclusiones `![[H-...#Afirmación]] <!-- sustento: H-... -->` y asegúrate de que toda cifra en prosa esté anclada en `valores_anclados` o en `00_Brief.md`, sin lenguaje de garantía incondicional (`100% garantizado`, `riesgo cero`, etc.).
-2. Llama a `m37_verify_and_compile(id_encargo=..., output_format="html", rerun_scripts=True)` para obtener el HTML ejecutivo autocontenido, el Markdown limpio y `mapa_trazabilidad.json`.
+### Paso 5 — Entregable
+1. En el nodo editorial usa `![[H-...#Afirmación]] <!-- sustento: H-... -->` e interpola cifras con `{{D-XX.clave}}`.
+2. `m37_verify_and_compile(id_encargo=..., output_format="html")`.
+3. Dile a la persona que el compilador verifica anclajes y linaje, no que la prosa diga lo mismo que cada hallazgo: esa lectura final es suya.
 """
 
 AGY_QA_AGENT_MARKDOWN = """---
@@ -128,12 +126,13 @@ Tu misión es atacar adversarialmente el Hallazgo (`H-*`) que se te asigne y emi
    - Tienes **ESTRÍCTAMENTE PROHIBIDO** leer `01_Plan.md`, `Nodos/N-*.md`, borradores en `Entregables/`, o `90_Bitacora/`.
 
 2. **Protocolo de Auditoría Epistémica**:
-   - Verifica que la `fuerza_afirmacion` (`hecho_verificado`, `inferencia_condicionada`, `prescripcion_accionable`, `hipotesis_de_trabajo`) sea proporcional a la evidencia citada.
+   - Verifica que la `fuerza_afirmacion` (`observacion_acotada`, `inferencia_condicionada`, `tesis_estructural_o_causal`, `prescripcion_accionable`) sea proporcional a la evidencia citada.
    - Verifica que los `valores_anclados` respalden las afirmaciones cuantitativas del texto y que las condiciones de validez e hipótesis rivales descartadas sean genuinas y no cosméticas.
    - Formula siempre un `mejor_ataque` sustantivo (el argumento más fuerte que podría refutar o debilitar el Hallazgo).
 
 3. **Emisión del Veredicto**:
-   - Registra tu decisión (`aceptar`, `aceptar_con_correcciones` o `rechazar`) llamando a `m37_record_qa_verdict` del servidor MCP `m37-kernel`.
+   - Registra tu decisión (`aceptar`, `aceptar_con_correcciones` o `rechazar`) llamando a `m37_record_qa_verdict` del servidor MCP `m37-kernel`. No llames a ninguna otra herramienta de `m37-kernel`.
+   - Tu veredicto queda registrado como no atestiguado (`revision_ciega_verificada: false`); en L3/L4 es consultivo.
 """
 
 CLAUDE_QA_AGENT_MARKDOWN = """---
@@ -152,8 +151,9 @@ Eres el **Auditor de QA Ciego (Blind QA)** del microkernel epistémico **M37 (Mo
 2. **Crítica Adversarial**:
    - Formula siempre un `mejor_ataque` concreto contra el Hallazgo.
    - Si detectas inflación de fuerza epistémica, extrapolación no demostrada o desconexión entre evidencia y conclusión, clasifica cada defecto con `id_defecto`, `severidad` (`bloqueante|mayor|menor`), `categoria`, `exige_cambio_material`, `ubicacion`, `evidencia` y `remediacion`.
-3. **Registro Criptográfico**:
-   - Llama a `mcp__m37-kernel__m37_record_qa_verdict` para sellar el veredicto `QA/V-*.md` con el `sha256_hallazgo_auditado`.
+3. **Registro**:
+   - Llama a `mcp__m37-kernel__m37_record_qa_verdict` para registrar el veredicto `QA/V-*.md`, ligado al hash del Hallazgo.
+   - Queda marcado como no atestiguado (`revision_ciega_verificada: false`); en L3/L4 es consultivo.
 """
 
 CLAUDE_COMMAND_M37 = """---
@@ -163,9 +163,9 @@ description: Inicia, planifica o continúa un encargo en el microkernel epistém
 Ejecuta el flujo de **M37 (Move 37)** sobre `$ARGUMENTS`:
 
 1. Llama a `m37_workspace_status` para inspeccionar el estado del workspace.
-2. Si se solicitó un nuevo encargo, usa `m37_init_or_new_engagement` y `m37_plan_engagement`.
-3. Ejecuta los nodos pendientes escribiendo todos los artefactos a través de `m37_write_artifact`.
-4. Para cada Hallazgo en rigor L3/L4, ejecuta `m37_prepare_blind_qa` y delega la auditoría al subagente aislado `m37-qa-ciego`.
+2. Si se solicitó un nuevo encargo, usa `m37_init_or_new_engagement` y `m37_plan_engagement`. Tras cada uno, detente y pide a la persona que ejecute `m37 approve <encargo> --gate 1` o `--gate 2` en su terminal.
+3. Ejecuta los nodos pendientes escribiendo todos los artefactos a través de `m37_write_artifact` con el `node_id` correspondiente.
+4. Para cada Hallazgo ejecuta `m37_prepare_blind_qa`; en rigor L3/L4 usa `m37_run_kernel_qa` o pide a la persona `m37 bless`.
 5. Al concluir, ejecuta `m37_verify_and_compile` para producir el entregable HTML/Markdown y `mapa_trazabilidad.json`.
 """
 
@@ -176,21 +176,136 @@ description: Ejecuta Fase A mecánica y lanza el subagente aislado m37-qa-ciego 
 Audita con QA Ciego el Hallazgo indicado en `$ARGUMENTS`:
 
 1. Llama a `m37_prepare_blind_qa` para validar Fase A mecánica y obtener `allowlist_files` y `subagent_prompt`.
-2. Si `phase_a_passed` es `true`, invoca al subagente `m37-qa-ciego` pasándole exclusivamente el `subagent_prompt` para que audite a ciegas y registre el veredicto con `m37_record_qa_verdict`.
+2. Si `phase_a_passed` es `true`, invoca al subagente `m37-qa-ciego` pasándole exclusivamente el `subagent_prompt`; registrará un veredicto no atestiguado con `m37_record_qa_verdict`.
+3. En rigor L3/L4 ejecuta además `m37_run_kernel_qa`; si no hay API key de otra familia, pide a la persona `m37 bless`.
 """
 
 CLAUDE_COMMAND_M37_COMPILE = """---
 description: Verifica en Fase A (re-ejecutando scripts en sandbox) y compila el entregable M37 en 5 pasadas deterministas.
 ---
 
-Llama a `m37_verify_and_compile` para el encargo indicado en `$ARGUMENTS` (con `rerun_scripts=true`) y presenta al usuario las rutas generadas (`html_path`, `markdown_path` y `traceability_map_path`).
+Llama a `m37_verify_and_compile` para el encargo indicado en `$ARGUMENTS` (con `rerun_scripts=true`) y presenta al usuario las rutas generadas (`html_path`, `markdown_path` y `traceability_map_path`). Recuérdale que el compilador verifica anclajes y linaje, no que la prosa coincida con cada hallazgo.
 """
 
 
+RULES_BLOCK_START = "<!-- >>> M37-RULES-START >>> -->"
+RULES_BLOCK_END = "<!-- <<< M37-RULES-END <<< -->"
+BACKUP_SUFFIX = ".m37.bak"
+
+
+class HarnessInstallError(RuntimeError):
+    """Raised when installing would destroy or corrupt a user's existing harness configuration."""
+
+
 def _resolve_python_command(portable: bool = False) -> str:
+    """Interpreter the harness must launch.
+
+    NOT `Path(sys.executable).resolve()`: inside a venv on Linux/macOS that follows the symlink to the base
+    interpreter, which does not have m37 or its dependencies installed.
+    """
     if portable:
         return "python"
-    return Path(sys.executable).resolve().as_posix()
+    return Path(sys.executable).absolute().as_posix()
+
+
+def _backup_once(path: Path) -> None:
+    """Keep the user's original file the first time M37 touches it."""
+    backup = path.with_name(path.name + BACKUP_SUFFIX)
+    if path.is_file() and not backup.exists():
+        backup.write_bytes(path.read_bytes())
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".m37.tmp")
+    tmp.write_bytes(content.replace("\r\n", "\n").encode("utf-8"))
+    os.replace(tmp, path)
+
+
+def _upsert_rules_block(path: Path, rules_markdown: str) -> None:
+    """Add or refresh the M37 rules inside CLAUDE.md / AGENTS.md without touching the user's own instructions."""
+    block = f"{RULES_BLOCK_START}\n{rules_markdown.strip()}\n{RULES_BLOCK_END}\n"
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    only_m37_rules = existing.lstrip().startswith("# M37 (Move 37) — Reglas") and RULES_BLOCK_START not in existing
+    if not existing.strip() or only_m37_rules:
+        # New file, or a file that only ever held M37-generated rules (any version): regenerate it whole.
+        _atomic_write(path, rules_markdown)
+        return
+    if RULES_BLOCK_START in existing and RULES_BLOCK_END in existing:
+        pre, rest = existing.split(RULES_BLOCK_START, 1)
+        _, post = rest.split(RULES_BLOCK_END, 1)
+        updated = pre.rstrip() + "\n\n" + block + post.lstrip("\n")
+    else:
+        _backup_once(path)
+        updated = existing.rstrip() + "\n\n" + block
+    _atomic_write(path, updated)
+
+
+def _merge_mcp_json(path: Path, *, python_cmd: str, repo_root: Path | None = None) -> None:
+    """Register `m37-kernel` in an .mcp.json-style file while preserving every other server."""
+    data: dict[str, Any] = {}
+    if path.is_file() and path.read_text(encoding="utf-8").strip():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise HarnessInstallError(
+                f"{path} no es JSON válido ({exc}); corrígelo o muévelo antes de instalar. No se modificó."
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise HarnessInstallError(f"{path} no contiene un objeto JSON en la raíz. No se modificó.")
+        data = loaded
+        other_servers = set(loaded.get("mcpServers") or {}) - {"m37-kernel"} if isinstance(loaded.get("mcpServers"), dict) else set()
+        if other_servers or set(loaded) - {"mcpServers"}:
+            _backup_once(path)
+    servers = data.get("mcpServers")
+    servers = dict(servers) if isinstance(servers, dict) else {}
+    servers["m37-kernel"] = build_mcp_config_json(python_cmd=python_cmd, repo_root=repo_root)["mcpServers"]["m37-kernel"]
+    data["mcpServers"] = servers
+    _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def probe_mcp_command(command: str, args: list[str], env: dict[str, str] | None = None, timeout_s: int = 30) -> bool:
+    """Launch the configured server and complete an MCP `initialize` handshake. True only if it really answers."""
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n"
+    try:
+        proc = subprocess.run(
+            [command, *args],
+            input=request,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env={**os.environ, **(env or {})},
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in proc.stdout.splitlines():
+        try:
+            resp = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(resp, dict) and (resp.get("result") or {}).get("serverInfo", {}).get("name") == "m37-kernel":
+            return True
+    return False
+
+
+def probe_configured_mcp(config_path: Path) -> bool | None:
+    """Probe the m37-kernel entry of an .mcp.json-style file. None when there is nothing to probe."""
+    if not config_path.is_file():
+        return None
+    try:
+        entry = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"]["m37-kernel"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    command = str(entry.get("command"))
+    args = [str(a) for a in entry.get("args") or []]
+    # A config file in a project directory is untrusted input: only ever launch the exact command this installer
+    # writes (this interpreter or the portable "python", running the m37 server module). Anything else is reported
+    # as not probed instead of being executed.
+    if args != ["-m", "m37.mcp_server"] or command not in (_resolve_python_command(), "python"):
+        return None
+    safe_env = {k: v for k, v in dict(entry.get("env") or {}).items() if k == "PYTHONUTF8"}
+    return probe_mcp_command(command, args, safe_env)
 
 
 def build_antigravity_plugin_json() -> dict[str, Any]:
@@ -237,10 +352,9 @@ def build_claude_plugin_json() -> dict[str, Any]:
 
 
 def build_mcp_config_json(*, python_cmd: str, repo_root: Path | None = None) -> dict[str, Any]:
+    # `repo_root` is accepted for backwards compatibility and ignored: the configured interpreter is the one where
+    # m37 is installed, so no machine-specific PYTHONPATH is written into shared files.
     env_block: dict[str, str] = {"PYTHONUTF8": "1"}
-    if repo_root is not None:
-        src_path = (repo_root / "src").resolve().as_posix()
-        env_block["PYTHONPATH"] = src_path
     return {
         "mcpServers": {
             "m37-kernel": {
@@ -260,11 +374,7 @@ def build_codex_toml_block(*, python_cmd: str, repo_root: Path | None = None) ->
         f'command = "{py_escaped}"',
         'args = ["-m", "m37.mcp_server"]',
     ]
-    if repo_root is not None:
-        src_escaped = (repo_root / "src").resolve().as_posix()
-        lines.append(f'env = {{ PYTHONUTF8 = "1", PYTHONPATH = "{src_escaped}" }}')
-    else:
-        lines.append('env = { PYTHONUTF8 = "1" }')
+    lines.append('env = { PYTHONUTF8 = "1" }')
     lines.append("# <<< M37-KERNEL-MCP-END <<<")
     return "\n".join(lines) + "\n"
 
@@ -288,17 +398,7 @@ def _upsert_codex_config_toml(config_path: Path, *, python_cmd: str, repo_root: 
 
 
 def _upsert_claude_global_mcp(claude_json_path: Path, *, python_cmd: str, repo_root: Path | None = None) -> None:
-    data: dict[str, Any] = {}
-    if claude_json_path.is_file():
-        try:
-            data = dict(json.loads(claude_json_path.read_text(encoding="utf-8")))
-        except Exception:  # noqa: BLE001
-            return
-    mcp_servers = dict(data.get("mcpServers") or {})
-    mcp_cfg = build_mcp_config_json(python_cmd=python_cmd, repo_root=repo_root)["mcpServers"]["m37-kernel"]
-    mcp_servers["m37-kernel"] = mcp_cfg
-    data["mcpServers"] = mcp_servers
-    write_utf8_lf(claude_json_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    _merge_mcp_json(claude_json_path, python_cmd=python_cmd, repo_root=repo_root)
 
 
 def install_antigravity_bundle(
@@ -346,13 +446,6 @@ def populate_workspace_harnesses(
     claude_files: dict[Path, str] = {
         ws / ".claude-plugin" / "plugin.json": json.dumps(build_claude_plugin_json(), ensure_ascii=False, indent=2)
         + "\n",
-        ws / ".mcp.json": json.dumps(
-            build_mcp_config_json(python_cmd=python_cmd, repo_root=repo_root),
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        ws / "CLAUDE.md": M37_RULES_MARKDOWN,
         ws / ".claude" / "agents" / "m37-qa-ciego.md": CLAUDE_QA_AGENT_MARKDOWN,
         ws / ".claude" / "skills" / "m37" / "SKILL.md": M37_SKILL_MARKDOWN,
         ws / ".claude" / "commands" / "m37.md": CLAUDE_COMMAND_M37,
@@ -363,15 +456,20 @@ def populate_workspace_harnesses(
     for path, content in claude_files.items():
         write_utf8_lf(path, content)
         claude_written.append(str(path))
+    # Files the user may already own are merged, never replaced (NA3).
+    _merge_mcp_json(ws / ".mcp.json", python_cmd=python_cmd, repo_root=repo_root)
+    _upsert_rules_block(ws / "CLAUDE.md", M37_RULES_MARKDOWN)
+    claude_written.extend([str(ws / ".mcp.json"), str(ws / "CLAUDE.md")])
 
     codex_files: dict[Path, str] = {
-        ws / "AGENTS.md": M37_RULES_MARKDOWN,
         ws / ".codex" / "config.toml.example": build_codex_toml_block(python_cmd=python_cmd, repo_root=repo_root),
     }
     codex_written: list[str] = []
     for path, content in codex_files.items():
         write_utf8_lf(path, content)
         codex_written.append(str(path))
+    _upsert_rules_block(ws / "AGENTS.md", M37_RULES_MARKDOWN)
+    codex_written.append(str(ws / "AGENTS.md"))
 
     return {
         "antigravity": agy_written,
@@ -398,8 +496,11 @@ def install_harness_plugin(
 
     home = Path(home_dir).expanduser().resolve() if home_dir else Path.home().resolve()
     repo_root = get_core_repo_root()
-    ws_root = Path(workspace_dir).expanduser().resolve() if workspace_dir else repo_root
+    ws_root = Path(workspace_dir).expanduser().resolve() if workspace_dir else Path.cwd().resolve()
     py_cmd = _resolve_python_command(portable=portable_python)
+    # The engine checkout carries a committed, machine-independent copy of the bundle. Installing "into" it must
+    # regenerate that copy byte-for-byte, not stamp this machine's interpreter path into tracked files.
+    ws_py_cmd = _resolve_python_command(portable=portable_python or ws_root == repo_root.resolve())
 
     installed: dict[str, list[str]] = {"antigravity": [], "claude": [], "codex": []}
 
@@ -451,7 +552,7 @@ def install_harness_plugin(
     if norm_scope in ("workspace", "both"):
         ws_res = populate_workspace_harnesses(
             ws_root,
-            python_cmd=_resolve_python_command(portable=portable_python),
+            python_cmd=ws_py_cmd,
             repo_root=repo_root,
         )
         for k in ("antigravity", "claude", "codex"):
@@ -474,7 +575,7 @@ def inspect_harness_status(
 ) -> dict[str, Any]:
     """Return installation status across Antigravity, Claude Code, and OpenAI Codex CLI."""
     home = Path(home_dir).expanduser().resolve() if home_dir else Path.home().resolve()
-    ws = Path(workspace_dir).expanduser().resolve() if workspace_dir else get_core_repo_root()
+    ws = Path(workspace_dir).expanduser().resolve() if workspace_dir else Path.cwd().resolve()
 
     agy_global = (home / ".gemini" / "config" / "plugins" / "m37" / "plugin.json").is_file()
     agy_ws = (ws / "plugins" / "m37" / "plugin.json").is_file() and (

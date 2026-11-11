@@ -33,6 +33,8 @@ class ModelCapabilities(BaseModel):
 class ModelOperationalLimits(BaseModel):
     permitir_edit_quirurgico: bool = False
     temperatura_recomendada: float = Field(ge=0.0, le=2.0, default=0.2)
+    # Tope de tokens de salida por turno enviado al proveedor (C1: el runner lo lee en la ruta real de LiteLLM).
+    max_output_tokens: int = Field(gt=0, default=8192)
 
 
 class ModelCatalogEntry(BaseModel):
@@ -96,13 +98,57 @@ class WorkspacePaths:
         return self.vault_root / ".indice" / "grafo.duckdb"
 
 
+def _is_engine_checkout(candidate: Path) -> bool:
+    """A real engine checkout has all three; a stray `starter_vault/` higher up the tree is not enough."""
+    return (
+        (candidate / "starter_vault" / "00_Sistema").is_dir()
+        and (candidate / "extensions").is_dir()
+        and (candidate / "src" / "m37").is_dir()
+    )
+
+
 def get_core_repo_root() -> Path:
-    """Locate the m37-core repository root containing starter_vault/."""
+    """Locate the engine root that holds `starter_vault/` and `extensions/`.
+
+    Source checkout / editable install: the repository root.
+    Wheel install: a private resource directory materialised from the packaged data (see `_packaged_resource_root`).
+    """
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / "starter_vault").is_dir():
+        if _is_engine_checkout(parent):
             return parent
+    packaged = _packaged_resource_root()
+    if packaged is not None:
+        return packaged
     return here.parents[2]
+
+
+def _packaged_resource_root() -> Path | None:
+    """Wheel layout: m37/_starter_vault and m37/_extensions sit next to this file.
+
+    Callers expect `<root>/starter_vault` and `<root>/extensions`, so expose them under a per-user cache directory
+    keyed by version (site-packages may be read-only).
+    """
+    pkg_dir = Path(__file__).resolve().parent
+    starter_src = pkg_dir / "_starter_vault"
+    ext_src = pkg_dir / "_extensions"
+    if not (starter_src / "00_Sistema").is_dir() or not ext_src.is_dir():
+        return None
+    import shutil
+
+    from m37 import __version__
+
+    base = Path(os.environ.get("M37_RESOURCE_CACHE") or (Path.home() / ".cache" / "m37")).expanduser()
+    root = base / f"resources-{__version__}"
+    marker = root / ".complete"
+    if not marker.is_file():
+        for src, name in ((starter_src, "starter_vault"), (ext_src, "extensions")):
+            dest = root / name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        marker.write_text("ok\n", encoding="utf-8")
+    return root
 
 
 def get_starter_vault_dir() -> Path:
@@ -199,27 +245,38 @@ def check_privacy_gate(rigor: RigorLevel, env: Mapping[str, str]) -> None:
         )
 
 
+def _git_ignores_path(repo_root: Path, target: Path) -> bool:
+    """True only when git itself confirms that `target` is ignored inside `repo_root`."""
+    try:
+        proc = subprocess.run(
+            ["git", "check-ignore", "-q", str(target)],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def check_git_leak_safety(workspace_root: Path, core_repo_root: Path | None = None) -> tuple[bool, str]:
-    """SPEC-01 §5: Ensure M37_VAULT is not inside the m37-core repository tree."""
+    """SPEC-01 §5: Ensure M37_VAULT is not inside the engine repository tree.
+
+    Fail-closed (M6): a workspace inside a git-tracked engine checkout raises unless git confirms the
+    path is ignored. The decision no longer depends on how the remote happens to be named.
+    """
     core_root = (core_repo_root or get_core_repo_root()).resolve()
     ws_resolved = workspace_root.resolve()
     if ws_resolved == core_root or core_root in ws_resolved.parents:
-        try:
-            proc = subprocess.run(
-                ["git", "remote", "-v"],
-                cwd=core_root,
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            remote_info = proc.stdout.strip()
-        except OSError:
-            remote_info = ""
         msg = (
-            f"ADVERTENCIA DE FUGA GIT: El workspace ({ws_resolved}) está dentro del árbol de m37-core ({core_root})."
+            f"ADVERTENCIA DE FUGA GIT: El workspace ({ws_resolved}) está dentro del árbol del motor M37 ({core_root})."
         )
-        if "m37-core" in remote_info:
-            raise GitLeakSafetyError(msg + " Remoto m37-core detectado; mueve el workspace fuera del repositorio.")
+        is_git_checkout = (core_root / ".git").exists()
+        if is_git_checkout and (ws_resolved == core_root or not _git_ignores_path(core_root, ws_resolved)):
+            raise GitLeakSafetyError(
+                msg + " El repositorio está bajo git y la ruta no está ignorada; mueve el workspace fuera del repositorio."
+            )
         return False, msg
-    return True, "Workspace físicamente separado de m37-core."
+    return True, "Workspace físicamente separado del motor M37."

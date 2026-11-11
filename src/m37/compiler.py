@@ -15,6 +15,7 @@ from typing import Any
 import markdown as md_lib
 
 from m37.config import WorkspacePaths, get_core_repo_root
+from m37.gates import evaluate_gate_1
 from m37.guards import resolve_artifact_by_id, write_utf8_lf
 from m37.schemas import (
     EPISTEMIC_RANK,
@@ -24,12 +25,12 @@ from m37.schemas import (
     DerivationContract,
     EvidenceContract,
     FindingContract,
-    QAVerdictContract,
     extract_wikilink_id,
     parse_raw_artifact,
     validate_artifact_content,
 )
 from m37.verify import (
+    describe_latest_verdict,
     has_valid_content_bound_qa_verdict,
     refresh_engagement_hashes_and_quarantine,
     verify_derivation_phase_a,
@@ -43,6 +44,23 @@ INTERPOLATION_RE = re.compile(
 )
 WIKILINK_INLINE_RE = re.compile(r"(?<!!)\[\[([^\]#|]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]")
 EXECUTABLE_FENCE_RE = re.compile(r"^`{3,}\s*\{\s*[A-Za-z0-9_+-]+", re.MULTILINE)
+# M5: Pandoc/Quarto raw blocks (```{=html}, ```{=latex}), raw inline (`x`{=latex}) and shortcodes ({{< include >}})
+# survive --no-execute and can inject markup or pull arbitrary local files into the render.
+QUARTO_RAW_OR_SHORTCODE_RE = re.compile(r"\{\{\s*<|^`{3,}\s*\{\s*=|`\{\s*=", re.MULTILINE)
+MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)")
+MD_IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\s*\[[^\]]*\]")
+MD_LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(\s*<?([^)\s>]+)")
+MD_LINK_DEF_RE = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?(\S+)", re.MULTILINE)
+SAFE_LINK_SCHEMES = frozenset({"http", "https", "mailto"})
+SAFE_FMT_SPEC_RE = re.compile(r"^[<>^=]?[+\- ]?#?0?\d{0,2}[,_]?(?:\.\d{1,2})?[bcdeEfFgGnosxX%]?$")
+HTML_UNSAFE_HREF_RE = re.compile(
+    r'(href|src)\s*=\s*(["\'])\s*(?!https?:|mailto:|#)[a-zA-Z][a-zA-Z0-9+.\-]*:[^"\']*\2',
+    re.IGNORECASE,
+)
+URL_IN_PROSE_RE = re.compile(r"\]\([^)]*\)|https?://\S+")
+NUMBER_IN_PROSE_RE = re.compile(r"(?<![A-Za-z0-9_])\d+(?:[.,]\d+)*")
+ORDERED_LIST_MARKER_RE = re.compile(r"^\s*\d+[.)]\s", re.MULTILINE)
+VERIFICATION_SCOPE_LABEL = "Anclajes y linaje verificados mecánicamente · prosa no auditada por QA"
 DANGEROUS_RAW_HTML_RE = re.compile(
     r"<\s*/?\s*(script|img|iframe|object|embed|svg|link|style|form|input|meta|base|audio|video)\b",
     re.IGNORECASE,
@@ -59,6 +77,104 @@ PROSE_QUANT_METRIC_RE = re.compile(
     r"|\b\d+(?:[.,]\d+)?\s+(?:meses|años)\b)",
     re.IGNORECASE,
 )
+
+
+def _url_scheme(target: str) -> str | None:
+    cleaned = re.sub(r"[\x00-\x20]+", "", html.unescape(target)).strip("<>").lower()
+    m = re.match(r"^([a-z][a-z0-9+.\-]*):", cleaned)
+    if m:
+        return m.group(1)
+    return "//" if cleaned.startswith("//") else None
+
+
+def find_active_markup_violation(text: str) -> str | None:
+    """A3/M5: return a human-readable reason if the Markdown carries script links, remote images or Quarto raw markup."""
+    if QUARTO_RAW_OR_SHORTCODE_RE.search(text):
+        return "bloques o atributos raw de Pandoc/Quarto (`{=html}`, `{=latex}`) o shortcodes (`{{< ... >}}`)"
+    if MD_IMAGE_REF_RE.search(text):
+        return "imagen con referencia indirecta (`![x][ref]`)"
+    for m in MD_IMAGE_RE.finditer(text):
+        if _url_scheme(m.group(1)) is not None:
+            return f"imagen remota o con esquema ({m.group(1)[:60]!r}); un entregable no debe cargar recursos externos"
+    for regex in (MD_LINK_RE, MD_LINK_DEF_RE):
+        for m in regex.finditer(text):
+            scheme = _url_scheme(m.group(1))
+            if scheme is not None and scheme not in SAFE_LINK_SCHEMES:
+                return f"enlace con esquema no permitido ({m.group(1)[:60]!r}); solo http, https, mailto o anclas"
+    return None
+
+
+def _numeric_variants(raw_number: str) -> set[str]:
+    norm = raw_number.replace(",", ".")
+    variants = {norm}
+    try:
+        fval = float(norm)
+        variants.update({f"{fval:g}", f"{fval:.1f}", f"{fval:.2f}"})
+    except ValueError:
+        pass
+    return variants
+
+
+def _unit_class(phrase: str) -> str:
+    if re.search(r"USD|MXN|EUR|\$", phrase, re.IGNORECASE):
+        return "dinero"
+    if "%" in phrase:
+        return "porcentaje"
+    return "tiempo"
+
+
+def classed_numbers_from_text(text: str) -> set[tuple[str, str]]:
+    """Numbers found in prose-like source text, tagged with the unit they carry ('dinero', 'porcentaje', 'tiempo', 'sin_unidad')."""
+    cleaned = URL_IN_PROSE_RE.sub(" ", text)
+    out: set[tuple[str, str]] = set()
+    unit_spans: list[tuple[int, int]] = []
+    for m in PROSE_QUANT_METRIC_RE.finditer(cleaned):
+        unit_spans.append((m.start(), m.end()))
+        cls = _unit_class(m.group(0))
+        for num in NUMBER_IN_PROSE_RE.findall(m.group(0)):
+            out.update((v, cls) for v in _numeric_variants(num))
+    for m in NUMBER_IN_PROSE_RE.finditer(cleaned):
+        if not any(a <= m.start() and m.end() <= b for a, b in unit_spans):
+            out.update((v, "sin_unidad") for v in _numeric_variants(m.group(0)))
+    return out
+
+
+def classed_numbers_from_values(payload: Any) -> set[tuple[str, str]]:
+    """Numbers held as structured values (valores_anclados, salidas): their unit lives in the key name, so any unit matches."""
+    return {(v, "*") for num in NUMBER_IN_PROSE_RE.findall(json.dumps(payload, ensure_ascii=False)) for v in _numeric_variants(num)}
+
+
+def find_unanchored_numbers(prose: str, allowed: set[Any]) -> list[str]:
+    """A2: every figure in the prose must match the cited sustento, with the same kind of unit.
+
+    - A metric with a unit (USD, %, meses, años) must appear in the sources with that same unit class, or as a
+      structured value of a cited Derivation/Hallazgo. "USD 12M" is not anchored by a "12%" elsewhere.
+    - Any other number that is decimal or >= 10 must appear somewhere in the sources.
+    - Bare single-digit integers ("3 escenarios"), calendar years and ordered-list markers are not treated as figures.
+    `allowed` holds (number, unit_class) pairs; plain strings are accepted as wildcard entries.
+    """
+    pairs: set[tuple[str, str]] = {a if isinstance(a, tuple) else (str(a), "*") for a in allowed}
+    by_number: dict[str, set[str]] = {}
+    for num, cls in pairs:
+        by_number.setdefault(num, set()).add(cls)
+
+    text = URL_IN_PROSE_RE.sub(" ", prose)
+    text = ORDERED_LIST_MARKER_RE.sub(" ", text)
+    unit_spans = [(m.start(), m.end(), _unit_class(m.group(0))) for m in PROSE_QUANT_METRIC_RE.finditer(text)]
+    offenders: list[str] = []
+    for m in NUMBER_IN_PROSE_RE.finditer(text):
+        raw = m.group(0)
+        cls = next((c for a, b, c in unit_spans if a <= m.start() and m.end() <= b), None)
+        if cls is None:
+            if raw.isdigit() and (int(raw) < 10 or 1900 <= int(raw) <= 2100):
+                continue
+            if any(v in by_number for v in _numeric_variants(raw)):
+                continue
+        else:
+            if any(by_number.get(v, set()) & {cls, "*"} for v in _numeric_variants(raw)):
+                continue
+        offenders.append(raw)
+    return offenders
 
 
 def _extract_numeric_tokens(text: str) -> set[str]:
@@ -207,7 +323,9 @@ def _has_approved_qa_verdict(
     finding_path: Path | None = None,
 ) -> bool:
     target_path = finding_path or resolve_artifact_by_id(paths, engagement_id, finding_id)
-    _, matches = has_valid_content_bound_qa_verdict(paths, engagement_id, finding_id, target_path)
+    _, matches = has_valid_content_bound_qa_verdict(
+        paths, engagement_id, finding_id, target_path, require_attested=True
+    )
     return matches
 
 
@@ -314,13 +432,22 @@ def compile_deliverable(
         raise FileNotFoundError(f"Falta 00_Brief.md en {enc_dir}.")
 
     brief_raw = brief_path.read_text(encoding="utf-8")
-    brief_obj, _, _ = validate_artifact_content(
+    brief_obj, brief_meta, brief_body = validate_artifact_content(
         brief_raw,
         suffix=".md",
         expected_tipo="brief",
     )
     assert isinstance(brief_obj, BriefContract)
     rigor = brief_obj.nivel_rigor
+    # `nivel_rigor` decides which checks run below. If the Brief is not the one a human sealed, lowering the rigor
+    # after the fact would silently switch off QA and anchoring requirements.
+    gate_ok, gate_reason = evaluate_gate_1(brief_meta, brief_body)
+    if not gate_ok:
+        raise CompilerAbortError(
+            f"PASADA 1 FALLIDA — No se compila sin una Puerta 1 vigente. {gate_reason}",
+            pass_number=1,
+            exit_code=2,
+        )
 
     entregables_dir = enc_dir / "Entregables"
     if deliverable_name:
@@ -355,6 +482,14 @@ def compile_deliverable(
             exit_code=2,
         )
 
+    markup_violation = find_active_markup_violation(deliv_body)
+    if markup_violation:
+        raise CompilerAbortError(
+            f"PASADA 1 FALLIDA — El entregable contiene {markup_violation}.",
+            pass_number=1,
+            exit_code=2,
+        )
+
     blocks = _split_markdown_blocks(deliv_body)
     block_findings_map: dict[int, list[str]] = {}
     orphan_blocks: list[str] = []
@@ -385,8 +520,21 @@ def compile_deliverable(
 
     all_referenced_fids = sorted({fid for fids in block_findings_map.values() for fid in fids})
     loaded_findings: dict[str, tuple[FindingContract, str]] = {}
-    finding_allowed_numbers: dict[str, set[str]] = {}
-    brief_numbers = _extract_numeric_tokens(brief_raw)
+    finding_allowed_numbers: dict[str, set[tuple[str, str]]] = {}
+    # A2: the allowed set is built ONLY from substantive content. Frontmatter dates, hashes and IDs used to leak
+    # dozens of incidental digit runs into it, which let unrelated figures pass as "anchored".
+    brief_numbers = classed_numbers_from_text(
+        "\n".join(
+            [
+                brief_body,
+                brief_obj.pregunta_central,
+                brief_obj.decision_que_habilita,
+                *brief_obj.alcance,
+                *brief_obj.exclusiones,
+                *brief_obj.hipotesis_a_falsear,
+            ]
+        )
+    )
     pass2_errors: list[str] = []
 
     for fid in all_referenced_fids:
@@ -420,7 +568,9 @@ def compile_deliverable(
                 continue
             if not _has_approved_qa_verdict(paths, engagement_id, f_obj.id):
                 pass2_errors.append(
-                    f"Hallazgo {fid} declara estado_qa={f_obj.estado_qa!r} pero no posee acta verificable en QA/V-*.md."
+                    f"Hallazgo {fid} declara estado_qa={f_obj.estado_qa!r} pero su último veredicto en QA/V-*.md no es "
+                    "válido para este rigor: debe aceptar, estar ligado al contenido actual y ser QA ciego atestiguado "
+                    "por el kernel (`m37 qa`) o un acta humana (`m37 bless`)."
                 )
                 continue
 
@@ -432,21 +582,36 @@ def compile_deliverable(
 
         loaded_findings[fid] = (f_obj, f_body)
 
-        allowed_nums = set(brief_numbers)
-        allowed_nums.update(_extract_numeric_tokens(f_obj.afirmacion_corta))
-        allowed_nums.update(_extract_numeric_tokens(f_body))
-        allowed_nums.update(_extract_numeric_tokens(json.dumps(f_obj.valores_anclados)))
+        allowed_nums: set[tuple[str, str]] = set(brief_numbers)
+        allowed_nums.update(classed_numbers_from_text(f_obj.afirmacion_corta))
+        allowed_nums.update(classed_numbers_from_text(f_obj.que_lo_refutaria))
+        allowed_nums.update(classed_numbers_from_text(f_body))
+        allowed_nums.update(classed_numbers_from_values(f_obj.valores_anclados))
         for ev_ref in f_obj.sustento_evidencia:
             try:
                 ev_p = resolve_artifact_by_id(paths, engagement_id, ev_ref)
-                allowed_nums.update(_extract_numeric_tokens(ev_p.read_text(encoding="utf-8")))
-            except FileNotFoundError:
+                ev_meta_n, ev_body_n = parse_raw_artifact(ev_p.read_text(encoding="utf-8"), suffix=ev_p.suffix)
+                allowed_nums.update(
+                    classed_numbers_from_text(
+                        "\n".join(
+                            [
+                                ev_body_n,
+                                str(ev_meta_n.get("titulo") or ""),
+                                str(ev_meta_n.get("localizador_verificable") or ""),
+                            ]
+                        )
+                    )
+                )
+            except (FileNotFoundError, ContractValidationError):
                 pass
         for der_ref in f_obj.sustento_derivaciones:
             try:
                 der_p = resolve_artifact_by_id(paths, engagement_id, der_ref)
-                allowed_nums.update(_extract_numeric_tokens(der_p.read_text(encoding="utf-8")))
-            except FileNotFoundError:
+                der_meta_n, _ = parse_raw_artifact(der_p.read_text(encoding="utf-8"), suffix=der_p.suffix)
+                allowed_nums.update(
+                    classed_numbers_from_values([der_meta_n.get("salidas") or {}, der_meta_n.get("metadatos_metodo") or {}])
+                )
+            except (FileNotFoundError, ContractValidationError):
                 pass
         finding_allowed_numbers[fid] = allowed_nums
 
@@ -518,19 +683,18 @@ def compile_deliverable(
             prose_without_placeholders = TRANSCLUSION_RE.sub("", prose_without_placeholders)
             prose_without_placeholders = SUSTENTO_COMMENT_RE.sub("", prose_without_placeholders)
             prose_without_placeholders = WIKILINK_INLINE_RE.sub("", prose_without_placeholders)
-            allowed_block_nums: set[str] = set()
+            allowed_block_nums: set[tuple[str, str]] = set()
             for fid in fids:
                 allowed_block_nums.update(finding_allowed_numbers.get(fid, set()))
-            for m_quant in PROSE_QUANT_METRIC_RE.finditer(prose_without_placeholders):
-                phrase = m_quant.group(0)
-                num_tokens = _extract_numeric_tokens(phrase)
-                if num_tokens and not (num_tokens & allowed_block_nums):
-                    raise CompilerAbortError(
-                        f"PASADA 3 FALLIDA — Cifra cuantitativa en prosa sin anclaje verificable ({phrase!r} en Bloque #{idx + 1}): "
-                        f"no coincide con {{D-XX.clave}} ni con el sustento de {fids}.",
-                        pass_number=3,
-                        exit_code=4,
-                    )
+            unanchored = find_unanchored_numbers(prose_without_placeholders, allowed_block_nums)
+            if unanchored:
+                raise CompilerAbortError(
+                    f"PASADA 3 FALLIDA — Cifra cuantitativa en prosa sin anclaje verificable ({unanchored[0]!r} en "
+                    f"Bloque #{idx + 1}; total sin anclar: {len(unanchored)}): no coincide con {{D-XX.clave}}, con "
+                    f"valores_anclados/salidas del sustento de {fids} ni con el Brief.",
+                    pass_number=3,
+                    exit_code=4,
+                )
 
         # 3a. Expand ![[H-XX#Sección]] transclusions
         def _replace_transclusion(match: re.Match[str]) -> str:
@@ -597,6 +761,13 @@ def compile_deliverable(
 
             interpolated_derivs.append(f"{deriv_id}.{key_path}")
             if fmt_spec is not None:
+                if not SAFE_FMT_SPEC_RE.fullmatch(fmt_spec):
+                    raise CompilerAbortError(
+                        f"PASADA 3 FALLIDA — Formato {fmt_spec!r} no permitido en {deriv_id}.{key_path}: "
+                        "usa especificaciones numéricas simples como '.2f', ',.0f' o '.1%'.",
+                        pass_number=3,
+                        exit_code=4,
+                    )
                 try:
                     return format(raw_val, fmt_spec)
                 except (ValueError, TypeError) as exc:
@@ -620,6 +791,13 @@ def compile_deliverable(
         if EXECUTABLE_FENCE_RE.search(cleaned) or DANGEROUS_RAW_HTML_RE.search(cleaned):
             raise CompilerAbortError(
                 f"PASADA 4 FALLIDA — Contenido transcluido contiene código ejecutable Quarto o HTML inseguro en Bloque #{idx + 1}.",
+                pass_number=4,
+                exit_code=4,
+            )
+        expanded_violation = find_active_markup_violation(cleaned)
+        if expanded_violation:
+            raise CompilerAbortError(
+                f"PASADA 4 FALLIDA — Contenido transcluido en Bloque #{idx + 1} contiene {expanded_violation}.",
                 pass_number=4,
                 exit_code=4,
             )
@@ -712,6 +890,7 @@ def compile_deliverable(
         "\n\n".join(rendered_html_blocks),
         extensions=["tables", "fenced_code", "sane_lists"],
     )
+    body_html = HTML_UNSAFE_HREF_RE.sub(lambda m: f'{m.group(1)}="#"', body_html)
     footnotes_html = ""
     if footnote_records:
         items_html = []
@@ -747,7 +926,7 @@ def compile_deliverable(
         "</head>\n"
         "<body>\n"
         '  <header class="m37-header">\n'
-        f'    <div class="kicker">M37 · Rigor {html.escape(rigor)} · Trazabilidad Verificada</div>\n'
+        f'    <div class="kicker">M37 · Rigor {html.escape(rigor)} · {html.escape(VERIFICATION_SCOPE_LABEL)}</div>\n'
         f"    <h1>{html.escape(title)}</h1>\n"
         f'    <div class="meta">Audiencia: {html.escape(brief_obj.audiencia)} · '
         f"Fecha: {brief_obj.fecha.isoformat()}</div>\n"
@@ -771,7 +950,21 @@ def compile_deliverable(
         "entregable_origen": source_md_path.name,
         "nivel_rigor": rigor,
         "compilado_utc": datetime.now(timezone.utc).isoformat(),
+        "alcance_verificacion": {
+            "verificado_mecanicamente": [
+                "contratos de todos los artefactos citados",
+                "vigencia de hash_insumos y de los sha256 de insumos",
+                "re-ejecución de scripts productores (L3/L4) y coincidencia de valores_anclados",
+                "veredicto QA ligado al contenido actual de cada hallazgo (L3/L4)",
+                "cifras en prosa presentes en el sustento citado o en el Brief (L3/L4)",
+            ],
+            "no_verificado": [
+                "que la prosa de cada bloque diga lo mismo que el hallazgo que cita",
+                "que los parámetros de los scripts provengan de la evidencia",
+            ],
+        },
         "hallazgos_totales_auditados": all_referenced_fids,
+        "qa_por_hallazgo": {fid: describe_latest_verdict(paths, engagement_id, fid) for fid in all_referenced_fids},
         "bloques": traceability_entries,
         "fuentes_primarias": footnote_records,
     }
@@ -797,7 +990,7 @@ def compile_deliverable(
 
         qmd_header = (
             "---\n"
-            f'title: "{title}"\n'
+            f"title: {json.dumps(title, ensure_ascii=False)}\n"
             f'date: "{brief_obj.fecha.isoformat()}"\n'
             "lang: es\n"
             "execute:\n"

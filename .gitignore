@@ -21,3 +21,7 @@ m37_workspace*/
 *.duckdb
 *.duckdb.wal
 .m37_locks/
+
+# Respaldos y temporales del instalador de plugins
+*.m37.bak
+*.m37.tmp

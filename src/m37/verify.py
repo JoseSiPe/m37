@@ -438,6 +438,16 @@ def verify_finding_phase_a(
             assert isinstance(ev_obj, EvidenceContract)
             if rigor in ("L3", "L4") and not ev_obj.cita_verificada:
                 errors.append(f"La evidencia {ev_obj.id} tiene cita_verificada=False (bloqueante en {rigor}).")
+            if ev_obj.cita_verificada and not ev_obj.snapshot_local:
+                # A hand-written `cita_verificada: true` with nothing to check it against is not a verified citation.
+                msg = (
+                    f"La evidencia {ev_obj.id} declara cita_verificada=True sin snapshot_local: "
+                    "no hay fuente registrada contra la cual comprobar el extracto."
+                )
+                if rigor in ("L3", "L4"):
+                    errors.append(msg)
+                else:
+                    warnings.append(msg)
             if ev_obj.snapshot_local:
                 snap_guard = ExecutionGuard(
                     paths,
@@ -452,7 +462,8 @@ def verify_finding_phase_a(
                 if not snap_ok:
                     errors.append(
                         f"Evidencia {ev_obj.id} declara snapshot_local={ev_obj.snapshot_local!r}, pero el archivo no existe "
-                        "en referencias/ o no contiene el extracto textual declarado."
+                        "en referencias/, no está registrado por el kernel (web_fetch_clean o `m37 ingest`), cambió desde "
+                        "su registro o no contiene el extracto textual declarado."
                     )
                 elif ev_obj.hash_snapshot and computed_snap_hash and (
                     ev_obj.hash_snapshot.removeprefix("sha256:") != computed_snap_hash.removeprefix("sha256:")
@@ -576,13 +587,25 @@ def verify_finding_phase_a(
     )
 
 
+def verdict_is_attested(verdict: QAVerdictContract) -> bool:
+    """NC3: a verdict counts for L3/L4 only if the kernel attested blindness or a human signed it with `m37 bless`."""
+    is_human_bless = verdict.id.startswith("V-BLESS-") and verdict.familia_auditor == "humano"
+    return bool(verdict.revision_ciega_verificada) or is_human_bless
+
+
 def has_valid_content_bound_qa_verdict(
     paths: WorkspacePaths,
     engagement_id: str,
     finding_id: str,
     finding_path: Path,
+    *,
+    require_attested: bool = False,
 ) -> tuple[bool, bool]:
-    """Return (has_any_verdict_for_finding, latest_verdict_approves_live_hash)."""
+    """Return (has_any_verdict_for_finding, latest_verdict_approves_live_hash).
+
+    With require_attested=True (L3/L4) the latest verdict must also be kernel-attested blind QA or a human bless;
+    a verdict relayed by a host-harness subagent (`revision_ciega_verificada: false`) is advisory only.
+    """
     qa_dir = paths.engagement_dir(engagement_id) / "QA"
     if not qa_dir.is_dir() or not finding_path.is_file():
         return False, False
@@ -610,8 +633,45 @@ def has_valid_content_bound_qa_verdict(
     is_approved = (
         latest_verdict.decision in ("aceptar", "aceptar_con_correcciones")
         and latest_verdict.sha256_artefacto_auditado == live_sha
+        and (not require_attested or verdict_is_attested(latest_verdict))
     )
     return True, is_approved
+
+
+def describe_latest_verdict(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    finding_id: str,
+) -> dict[str, Any] | None:
+    """M11: who audited a finding and under which guarantees, for the traceability map."""
+    qa_dir = paths.engagement_dir(engagement_id) / "QA"
+    if not qa_dir.is_dir():
+        return None
+    best: tuple[tuple[int, int, int, str], QAVerdictContract] | None = None
+    for vfile in qa_dir.glob("V-*.md"):
+        try:
+            v_obj, _, _ = validate_artifact_content(vfile.read_text(encoding="utf-8"), suffix=".md", expected_tipo="veredicto_qa")
+        except ContractValidationError:
+            continue
+        assert isinstance(v_obj, QAVerdictContract)
+        if extract_wikilink_id(v_obj.artefacto_auditado) != finding_id:
+            continue
+        is_bless = 1 if (v_obj.id.startswith("V-BLESS-") or vfile.name.startswith("V-BLESS-")) else 0
+        key = (is_bless, v_obj.ronda, vfile.stat().st_mtime_ns, vfile.name)
+        if best is None or key > best[0]:
+            best = (key, v_obj)
+    if best is None:
+        return None
+    verdict = best[1]
+    return {
+        "veredicto": verdict.id,
+        "decision": verdict.decision,
+        "ronda": verdict.ronda,
+        "modelo_auditor": verdict.modelo_auditor,
+        "familia_auditor": verdict.familia_auditor,
+        "revision_ciega_verificada": verdict.revision_ciega_verificada,
+        "atestiguado": verdict_is_attested(verdict),
+    }
 
 
 def refresh_engagement_hashes_and_quarantine(

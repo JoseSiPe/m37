@@ -13,8 +13,6 @@ from typing import Any, Callable
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 
-import litellm
-
 from m37.config import ModelCatalogEntry, WorkspacePaths
 from m37.guards import (
     PROFILE_ALLOWED_TOOLS,
@@ -24,8 +22,19 @@ from m37.guards import (
 )
 from m37.schemas import ContractValidationError
 
-litellm.telemetry = False
-litellm.suppress_debug_info = True
+_LITELLM: Any = None
+
+
+def _get_litellm() -> Any:
+    """Import LiteLLM lazily: CLI commands and the MCP server that never call a provider do not pay its import cost."""
+    global _LITELLM
+    if _LITELLM is None:
+        import litellm
+
+        litellm.telemetry = False
+        litellm.suppress_debug_info = True
+        _LITELLM = litellm
+    return _LITELLM
 
 
 ALL_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -236,7 +245,9 @@ def compute_turn_cost_usd(
     """SPEC-02 §3.3 #4: prefer litellm.completion_cost(); fall back to Modelos.yaml prices for unknown/custom models."""
     if not isinstance(response, dict):
         try:
-            real_cost = float(litellm.completion_cost(completion_response=response, model=model_entry.litellm_id) or 0.0)
+            real_cost = float(
+                _get_litellm().completion_cost(completion_response=response, model=model_entry.litellm_id) or 0.0
+            )
             if real_cost > 0.0:
                 return real_cost, "litellm"
         except Exception:  # noqa: BLE001 - modelo ausente del mapa local de costos de LiteLLM
@@ -334,14 +345,14 @@ def execute_stateless_node_loop(
     completion_fn: Callable[..., Any] | None = None,
 ) -> RunnerOutcome:
     """SPEC-02 §1 & §4: Execute an ephemeral, zero-memory-carryover multi-turn tool loop for a single node."""
-    import os
-
     guard = ExecutionGuard(paths, ctx)
     tools = get_tool_schemas_for_context(ctx)
-    call_llm = completion_fn or litellm.completion
+    call_llm = completion_fn or _get_litellm().completion
+    # C1: local models declare credencial_env: null; never index the environment with None.
+    cred_var = model_entry.credencial_env
     explicit_api_key = (
-        ctx.base_env.get(model_entry.credencial_env) or os.environ.get(model_entry.credencial_env) or ""
-    ).strip()
+        (ctx.base_env.get(cred_var) or os.environ.get(cred_var) or "").strip() if cred_var else ""
+    )
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
