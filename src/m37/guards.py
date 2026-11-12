@@ -472,6 +472,11 @@ def allocate_next_id(
         stem_prefix = f"E-{ym}-"
         digits = 3
         scan_dirs = [paths.vault_root / "30_Evidencia_Publica"]
+    elif prefix == "C":
+        # 50_Capital/ is shared by every client: its IDs carry a date and a sequence, never an engagement or client.
+        stem_prefix = f"C-{ym}-"
+        digits = 3
+        scan_dirs = [paths.vault_root / "50_Capital"]
     elif prefix == "N":
         if not engagement_id:
             raise ValueError("Generar IDs N-XX requiere engagement_id.")
@@ -605,8 +610,12 @@ def _parse_json_dict_from_stdout(stdout: str) -> dict[str, Any] | None:
     return None
 
 
-def _validate_public_http_url(url: str) -> None:
-    """Block SSRF against loopback, RFC1918 private networks, link-local (169.254.169.254), and internal hosts."""
+def _validate_public_http_url(url: str) -> str:
+    """Block SSRF against loopback, RFC1918 private networks, link-local (169.254.169.254), and internal hosts.
+
+    Returns the public IP the caller must connect to. Resolving once here and connecting to that same address closes
+    the DNS-rebinding window between "check" and "use".
+    """
     import ipaddress
     import socket
     import urllib.parse
@@ -638,18 +647,82 @@ def _validate_public_http_url(url: str) -> None:
 
     try:
         _check_ip(host)
-        return
+        return host
     except ValueError:
         pass
 
     try:
-        addr_infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
-    except socket.gaierror:
-        return
+        addr_infos = socket.getaddrinfo(
+            host,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        # Fail closed: an address that cannot be resolved cannot be validated.
+        raise PermissionDeniedError(
+            f"web_fetch_clean no pudo resolver {host!r}; sin dirección validada no hay conexión."
+        ) from exc
+    resolved: list[str] = []
     for info in addr_infos:
         sockaddr = info[4]
         if sockaddr and isinstance(sockaddr[0], str):
             _check_ip(sockaddr[0])
+            resolved.append(sockaddr[0])
+    if not resolved:
+        raise PermissionDeniedError(f"web_fetch_clean no obtuvo ninguna dirección para {host!r}.")
+    return resolved[0]
+
+
+def _bare_hostname(host_header: str) -> str:
+    """'example.org:8443' -> 'example.org'; '[2001:db8::1]:443' -> '2001:db8::1'."""
+    h = host_header.strip().lower()
+    if h.startswith("["):
+        return h[1:].split("]", 1)[0]
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def build_pinned_opener(pins: dict[str, str], redirect_handler: Any) -> Any:
+    """urllib opener whose sockets connect to the already-validated IP of each host.
+
+    The URL, the `Host:` header and the TLS server name stay the hostname; only the socket address is pinned. A host
+    without a pin (an HTTP proxy configured in the environment) connects normally: in that case name resolution
+    happens at the proxy and cannot be pinned from here.
+    """
+    import http.client
+    import socket
+    import ssl
+
+    class _PinnedHTTPConnection(http.client.HTTPConnection):
+        def connect(self) -> None:
+            pinned = pins.get(_bare_hostname(self.host))
+            if pinned is None:
+                super().connect()
+                return
+            self.sock = socket.create_connection((pinned, self.port), self.timeout, self.source_address)
+            if getattr(self, "_tunnel_host", None):
+                self._tunnel()  # type: ignore[attr-defined]
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def connect(self) -> None:
+            pinned = pins.get(_bare_hostname(self.host))
+            if pinned is None:
+                super().connect()
+                return
+            sock = socket.create_connection((pinned, self.port), self.timeout, self.source_address)
+            # Certificate and SNI are checked against the hostname, not the pinned IP.
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)  # type: ignore[attr-defined]
+
+    tls_context = ssl.create_default_context()
+
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req: Any) -> Any:
+            return self.do_open(_PinnedHTTPConnection, req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req: Any) -> Any:
+            return self.do_open(_PinnedHTTPSConnection, req, context=tls_context)
+
+    return urllib.request.build_opener(_PinnedHTTPHandler(), _PinnedHTTPSHandler(context=tls_context), redirect_handler)
 
 
 _CONTAINER_PROBE_CACHE: dict[tuple[str, str], bool] = {}
@@ -1976,17 +2049,25 @@ class ExecutionGuard:
     def web_fetch_clean(self, url: str, timeout_s: int = 20) -> str:
         """Fetch public HTTP(S) text with SSRF + allowlist protection, persist a REGISTERED snapshot, and wrap in fence."""
         self._require_tool_permission("web_fetch_clean")
-        _validate_public_http_url(url)
+        import urllib.parse
+
+        def _pin(target_url: str) -> None:
+            # Validate, then remember the exact address that was validated for this hostname.
+            pinned_ip = _validate_public_http_url(target_url)
+            pins[(urllib.parse.urlsplit(target_url).hostname or "").strip().lower()] = pinned_ip
+
+        pins: dict[str, str] = {}
+        _pin(url)
         self._enforce_web_fetch_policy(url)
         guard_self = self
 
         class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-                _validate_public_http_url(newurl)
+                _pin(newurl)
                 guard_self._enforce_web_fetch_policy(newurl)
                 return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-        opener = urllib.request.build_opener(_SafeRedirectHandler())
+        opener = build_pinned_opener(pins, _SafeRedirectHandler())
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "M37-CleanFetch/0.2 (+https://move37.local)"},

@@ -448,11 +448,15 @@ class QAVerdictContract(StrictContractModel):
     @model_validator(mode="after")
     def prohibir_aceptar_con_bloqueantes(self) -> QAVerdictContract:
         tiene_bloqueante = any(h.severidad == "bloqueante" for h in self.hallazgos_critica)
-        if tiene_bloqueante and self.decision == "aceptar":
-            raise ValueError("Prohibido emitir decision='aceptar' si existe algún hallazgo bloqueante.")
-        if any(est == "persiste" for est in self.resolucion_ronda_previa.values()) and self.decision == "aceptar":
+        acepta = self.decision in ("aceptar", "aceptar_con_correcciones")
+        if tiene_bloqueante and acepta:
             raise ValueError(
-                "Prohibido emitir decision='aceptar' en Ronda 2 si persiste un defecto bloqueante previo."
+                f"Prohibido emitir decision={self.decision!r} si existe algún hallazgo bloqueante: "
+                "un defecto bloqueante exige decision='rechazar'."
+            )
+        if acepta and any(est == "persiste" for est in self.resolucion_ronda_previa.values()):
+            raise ValueError(
+                f"Prohibido emitir decision={self.decision!r} en Ronda 2 si persiste un defecto de la ronda previa."
             )
         return self
 

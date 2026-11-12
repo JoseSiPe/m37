@@ -277,6 +277,34 @@ def _extract_json_dict_from_stdout(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def resolve_producer_script(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    productor_ref: str,
+) -> tuple[Path | None, bool]:
+    """Resolve a Derivation's `productor_ref` strictly inside analisis/<encargo>/.
+
+    Returns (script_path | None, points_outside_perimeter). Mirrors the write-time rule in
+    ExecutionGuard._validate_and_prepare_note so a file edited on disk cannot bypass it at verify time.
+    """
+    analisis_enc = (paths.analisis_root / engagement_id).resolve()
+    outside = False
+    for candidate in (
+        paths.workspace_root / productor_ref,
+        paths.analisis_root / engagement_id / productor_ref,
+    ):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not resolved.is_file():
+            continue
+        if analisis_enc in resolved.parents:
+            return resolved, False
+        outside = True
+    return None, outside
+
+
 def verify_derivation_phase_a(
     paths: WorkspacePaths,
     engagement_id: str,
@@ -324,12 +352,13 @@ def verify_derivation_phase_a(
             )
 
     if validated.productor_modo == "script":
-        script_candidates = [
-            (paths.workspace_root / validated.productor_ref).resolve(),
-            (paths.analisis_root / engagement_id / validated.productor_ref).resolve(),
-        ]
-        script_file = next((p for p in script_candidates if p.is_file()), None)
-        if script_file is None:
+        script_file, outside_perimeter = resolve_producer_script(paths, engagement_id, validated.productor_ref)
+        if outside_perimeter:
+            errors.append(
+                f"productor_ref de {validated.id} apunta fuera de analisis/{engagement_id}/ "
+                f"({validated.productor_ref!r}): un script productor solo puede vivir en el directorio de análisis del encargo."
+            )
+        elif script_file is None:
             errors.append(f"Script productor no encontrado para {validated.id}: {validated.productor_ref!r}")
         elif not validated.productor_sha256:
             errors.append(f"La Derivación {validated.id} con productor_modo='script' debe declarar productor_sha256.")
@@ -840,12 +869,11 @@ def build_blind_qa_allowlist(
 
         modo = d_meta.get("productor_modo")
         if modo == "script" and d_meta.get("productor_ref"):
-            for sc in (
-                paths.workspace_root / str(d_meta["productor_ref"]),
-                paths.analisis_root / engagement_id / str(d_meta["productor_ref"]),
-            ):
-                if sc.is_file():
-                    allowed.add(sc.resolve())
+            # Only a script inside analisis/<encargo>/ is ever readable by the blind auditor; a Derivation edited on
+            # disk to point at Entregables/, Nodos/ or another engagement must not widen the allowlist.
+            sc, _ = resolve_producer_script(paths, engagement_id, str(d_meta["productor_ref"]))
+            if sc is not None:
+                allowed.add(sc)
         elif modo == "verificacion_codigo":
             code_dir = (paths.codigo_root / engagement_id).resolve()
             if code_dir.is_dir():

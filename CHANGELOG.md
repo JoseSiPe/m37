@@ -1,5 +1,23 @@
 # Changelog
 
+## Sin publicar — seis hallazgos de auditoría (2026-11-12)
+
+### Cambios que rompen compatibilidad
+- **`m37 close`.** El capital promovido usa IDs anónimos `C-YYYYMM-NNN` (antes `C-<encargo>-NN`). Solo se promueve un
+  hallazgo con Fase A vigente y, en L3/L4, veredicto atestiguado; lo demás se lista en `capital_omitido` con su motivo.
+- **Compilador.** `{{D-XX.clave}}` solo puede interpolar una Derivación citada en `sustento_derivaciones` de un Hallazgo
+  citado en el mismo bloque.
+- **Veredictos QA.** `aceptar_con_correcciones` ya no es válido con un defecto bloqueante ni con uno que `persiste`.
+- **Derivaciones.** `productor_ref` debe resolver dentro de `analisis/<encargo>/`, en todos los niveles de rigor.
+- **`m37 qa` en Ronda 2.** Falla cerrado si la Ronda 1 exigía cambio material y falta `QA/.r1/<V>.snapshot`
+  (encargos auditados con una versión anterior de `m37 run`): repetir la Ronda 1 o usar `m37 bless`.
+- **`m37 run` en Ronda 2.** Si el hallazgo no cambió, no se llama al segundo auditor: `rechazado` y `escalado_humano`.
+- **Instalador.** `--scope workspace` escribe solo los archivos del `--target` pedido.
+
+### Corregido
+- `web_fetch_clean` conecta a la IP que validó (anti-DNS-rebinding) y rechaza hosts que no resuelven.
+- Servidor MCP `mcp_episodic_graph`: workspace fijado, `ping`, errores JSON-RPC y encuadre `Content-Length`.
+
 ## Sin publicar — remediación Fase 1 y 2 de la auditoría 2026-11-11
 
 ### Cambios que rompen compatibilidad

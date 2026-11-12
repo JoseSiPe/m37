@@ -976,6 +976,7 @@ def _build_qa_verdict_cheatsheet(
         "exige_cambio_material (bool), ubicacion, evidencia, remediacion}`\n"
         "- `resolucion_ronda_previa`: diccionario `{}` (en Ronda 2, mapea cada `DEF-*` a `'resuelto_materialmente'|'persiste'`)\n"
         "- `decision`: `aceptar` | `aceptar_con_correcciones` | `rechazar`\n"
+        "  (con un defecto `bloqueante`, o con uno previo que `persiste`, la única decisión válida es `rechazar`)\n"
     )
 
 
@@ -1217,6 +1218,10 @@ def run_engagement(
                         completion_fn=completion_fn,
                     )
                     _accumulate(qa1_outcome)
+                    if v_r1_abs.is_file():
+                        # Persist what the Ronda 1 auditor saw as soon as a verdict exists, even if the node stops
+                        # right here on budget: a later `m37 qa` Ronda 2 depends on it.
+                        write_utf8_lf(enc_dir / "QA" / ".r1" / f"{v_r1_id}.snapshot", r1_raw_snapshot)
                     if qa1_outcome.status == "bloqueado_presupuesto" or total_node_cost > node_budget_limit:
                         approved_r1 = False
                         final_node_state = "bloqueado_presupuesto"
@@ -1238,6 +1243,9 @@ def run_engagement(
                         final_node_state = "escalado_humano"
                         continue
                     veredicto_qa_r1_str = v1_obj.decision
+                    # Persist what the Ronda 1 auditor actually saw. `m37 qa` needs it to enforce
+                    # `exige_cambio_material` if this node escalates and Ronda 2 happens in a later process.
+                    write_utf8_lf(enc_dir / "QA" / ".r1" / f"{v1_obj.id}.snapshot", r1_raw_snapshot)
 
                     if v1_obj.decision == "aceptar":
                         _set_finding_qa_state(hpath, "aprobado")
@@ -1294,6 +1302,16 @@ def run_engagement(
                             _set_finding_qa_state(hpath, "rechazado")
                             deliverable_errors.append(
                                 f"Ronda 2 intentó crear hallazgos adicionales sin auditar: {[p.name for p in r2_new_findings]}"
+                            )
+                            final_node_state = "escalado_humano"
+                            continue
+
+                        # A rejected finding that comes back byte-for-byte identical in substance is not a
+                        # remediation: do not spend budget asking a second auditor about the same content.
+                        if compute_finding_substantive_sha256(hpath) == v1_obj.sha256_artefacto_auditado:
+                            _set_finding_qa_state(hpath, "rechazado")
+                            deliverable_errors.append(
+                                f"Ronda 2 sin cambios: {hpath.name} no fue modificado tras el rechazo de {v1_obj.id}."
                             )
                             final_node_state = "escalado_humano"
                             continue
@@ -1562,6 +1580,12 @@ def run_kernel_blind_qa(
         snap_file = enc_dir / "QA" / ".r1" / f"{r1_obj.id}.snapshot"
         if snap_file.is_file():
             r1_snapshot_text = snap_file.read_text(encoding="utf-8")
+        elif any(issue.exige_cambio_material for issue in r1_obj.hallazgos_critica):
+            # Fail closed: without the Ronda 1 snapshot the kernel cannot tell a material change from a cosmetic one.
+            raise PermissionError(
+                f"{bare_hid}: el veredicto {r1_obj.id} exige cambio material y no existe el snapshot de Ronda 1 "
+                f"(QA/.r1/{r1_obj.id}.snapshot) para comprobarlo. Requiere decisión humana: `m37 bless` o retirar el hallazgo."
+            )
 
     phase_a = verify_finding_phase_a(
         paths,
@@ -1904,7 +1928,13 @@ def close_engagement(
         if tok
     ]
 
-    staged_promotions: list[tuple[str, Path, str]] = []
+    # Promotion is decided on the LIVE state, not on what the frontmatter claimed before: refresh lineage first so a
+    # quarantined input or a post-QA edit downgrades estado_qa before anything is considered.
+    refresh_engagement_hashes_and_quarantine(paths, engagement_id)
+    needs_attested = brief_obj.nivel_rigor in ("L3", "L4")
+
+    eligible: list[tuple[FindingContract, str]] = []
+    omitted: list[dict[str, str]] = []
     hallazgos_dir = enc_dir / "Hallazgos"
     if promote_capital and hallazgos_dir.is_dir():
         for hfile in sorted(hallazgos_dir.glob("H-*.md")):
@@ -1917,7 +1947,21 @@ def close_engagement(
             if not f_obj.promovible_a_capital:
                 continue
             if f_obj.estado_qa not in ("aprobado", "aprobado_con_correcciones"):
+                omitted.append({"hallazgo": f_obj.id, "motivo": f"estado_qa={f_obj.estado_qa}"})
                 continue
+            phase_a = verify_finding_phase_a(paths, engagement_id, hfile, rigor=brief_obj.nivel_rigor)
+            if not phase_a.passed:
+                omitted.append({"hallazgo": f_obj.id, "motivo": "Fase A falló: " + "; ".join(phase_a.errors)[:300]})
+                continue
+            if needs_attested:
+                saw_verdict, verdict_ok = has_valid_content_bound_qa_verdict(
+                    paths, engagement_id, f_obj.id, hfile, require_attested=True
+                )
+                if not (saw_verdict and verdict_ok):
+                    omitted.append(
+                        {"hallazgo": f_obj.id, "motivo": "sin veredicto QA atestiguado ligado al contenido actual"}
+                    )
+                    continue
 
             combined_text = f"{f_obj.afirmacion_corta}\n{f_body}"
             for tok, pat in leak_patterns:
@@ -1926,26 +1970,42 @@ def close_engagement(
                         f"Bloqueo de confidencialidad en promoción a 50_Capital/: el Hallazgo {f_obj.id} "
                         f"menciona al cliente o encargo {tok!r}. Anonimiza el hallazgo antes de cerrar el encargo."
                     )
+            eligible.append((f_obj, f_body))
 
-            cap_id = f"C-{f_obj.id}"
-            cap_meta = {
-                "id": cap_id,
-                "tipo": "capital_intelectual",
-                "dominio": f_obj.dominio,
-                "fuerza_afirmacion": f_obj.fuerza_afirmacion,
-                "afirmacion_corta": f_obj.afirmacion_corta,
-                "metodo": f_obj.metodo,
-                "fecha_promocion": date.today().isoformat(),
-            }
-            cap_path = paths.vault_root / "50_Capital" / f"{cap_id}.md"
-            staged_promotions.append((cap_id, cap_path, dump_markdown_note(cap_meta, f_body)))
+    # 50_Capital/ is shared by every client: IDs and file names are anonymous (C-YYYYMM-NNN) and the whole serialized
+    # note plus its file name is scanned, not just the prose.
+    staged_promotions: list[tuple[str, str, Path, str]] = []
+    for f_obj, f_body in eligible:
+        cap_id = allocate_next_id(paths, "C")
+        cap_meta = {
+            "id": cap_id,
+            "tipo": "capital_intelectual",
+            "dominio": f_obj.dominio,
+            "fuerza_afirmacion": f_obj.fuerza_afirmacion,
+            "afirmacion_corta": f_obj.afirmacion_corta,
+            "metodo": f_obj.metodo,
+            "fecha_promocion": date.today().isoformat(),
+        }
+        cap_path = paths.vault_root / "50_Capital" / f"{cap_id}.md"
+        serialized_cap = dump_markdown_note(cap_meta, f_body)
+        scan_text = f"{cap_path.name}\n{serialized_cap}"
+        for tok, pat in leak_patterns:
+            if pat.search(scan_text):
+                raise ClientLeakInCapitalError(
+                    f"Bloqueo de confidencialidad en promoción a 50_Capital/: la nota de capital derivada de "
+                    f"{f_obj.id} contendría {tok!r}. Anonimiza el hallazgo antes de cerrar el encargo."
+                )
+        staged_promotions.append((cap_id, f_obj.id, cap_path, serialized_cap))
 
     # Atomic commit: only write to 50_Capital/ after ALL findings pass the confidentiality scan
     promoted: list[str] = []
-    for cap_id, cap_path, serialized_cap in staged_promotions:
+    origin_map: dict[str, str] = {}
+    for cap_id, finding_id, cap_path, serialized_cap in staged_promotions:
         write_utf8_lf(cap_path, serialized_cap)
         promoted.append(cap_id)
+        origin_map[cap_id] = finding_id
 
+    # The link capital -> finding lives only in 90_Bitacora/, which no execution agent can read.
     ep_note_path = paths.vault_root / "90_Bitacora" / f"EP-{engagement_id}.md"
     ep_meta = {
         "tipo": "ficha_episodica_nivel_1",
@@ -1953,6 +2013,8 @@ def close_engagement(
         "fecha_cierre": date.today().isoformat(),
         "nivel_rigor": brief_obj.nivel_rigor,
         "capital_promovido": promoted,
+        "capital_origen": origin_map,
+        "capital_omitido": omitted,
     }
     ep_body = f"## Lecciones Aprendidas\n\n{leccion.strip()}\n"
     write_utf8_lf(ep_note_path, dump_markdown_note(ep_meta, ep_body))
@@ -1963,10 +2025,16 @@ def close_engagement(
             "evento": "encargo_cerrado",
             "encargo": engagement_id,
             "capital_promovido": promoted,
+            "capital_omitido": [o["hallazgo"] for o in omitted],
             "leccion": leccion.strip(),
         },
     )
-    return {"ficha_episodica": str(ep_note_path), "capital_promovido": promoted}
+    return {
+        "ficha_episodica": str(ep_note_path),
+        "capital_promovido": promoted,
+        "capital_origen": origin_map,
+        "capital_omitido": omitted,
+    }
 
 
 # ======================================================================
