@@ -14,11 +14,10 @@ from m37.cli import (
     create_new_engagement,
     generate_plan_from_archetype,
     init_workspace,
-    run_engagement,
     verify_engagement,
 )
 from m37.compiler import CompilerAbortError
-from m37.config import ModelCatalogEntry, PrivacyGateError, load_model_catalog
+from m37.config import PrivacyGateError, load_model_catalog
 from m37.guards import (
     AgentExecutionContext,
     ExecutionGuard,

@@ -1,8 +1,20 @@
 """M37 (Move 37) — Universal Multi-Harness MCP Server (Antigravity, Claude Code, OpenAI Codex CLI).
 
-Exposes the deterministic M37 Microkernel guards, Phase A mechanical verifiers,
-Blind QA allowlist builder, 5-pass deliverable compiler, and 5 bitemporal graph
-queries over standard MCP JSON-RPC 2.0 (stdio) with zero external API keys required.
+Exposes the M37 guards, Phase A verifiers, Blind QA allowlist builder, 5-pass compiler and graph queries over
+MCP JSON-RPC 2.0 (stdio).
+
+TRUST MODEL — read before extending this file.
+In harness mode the host agent has its own file and shell tools: this server is NOT a reference monitor, it only
+governs what is routed through it. Therefore nothing a human or the kernel must decide is exposed as a tool:
+
+  * No tool approves Puerta 1 or 2 (`m37 approve`, interactive terminal only).
+  * No tool creates a citable snapshot (`web_fetch_clean` by the kernel, or `m37 ingest` by a human).
+  * A verdict relayed by a harness subagent is recorded as NOT attested; L3/L4 needs `m37_run_kernel_qa`
+    (kernel calls a different-family model through the API) or a human `m37 bless`.
+  * The tool profile comes from the node file on disk, never from the caller.
+
+What `verify` and `compile` recompute from disk (contracts, hash lineage, verdict-to-content binding, script
+re-execution) holds regardless of who wrote the files.
 """
 
 from __future__ import annotations
@@ -13,15 +25,23 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from m37 import __version__
+from m37 import __version__, gates
 from m37.cli import (
     compile_deliverable,
     create_new_engagement,
     generate_plan_from_archetype,
     init_workspace,
+    run_kernel_blind_qa,
     verify_engagement,
 )
-from m37.config import WorkspacePaths, get_core_repo_root, resolve_workspace_paths
+from m37.config import (
+    WorkspacePaths,
+    check_privacy_gate,
+    extract_secret_values,
+    get_core_repo_root,
+    load_effective_env,
+    resolve_workspace_paths,
+)
 from m37.guards import (
     AgentExecutionContext,
     ExecutionGuard,
@@ -29,20 +49,42 @@ from m37.guards import (
     resolve_artifact_by_id,
     write_utf8_lf,
 )
+from m37.runner import append_episodic_event
 from m37.schemas import (
     BriefContract,
     FindingContract,
     NodeContract,
-    PlanContract,
-    compute_brief_substantive_sha256,
     compute_finding_substantive_sha256,
-    compute_plan_dag_sha256,
     dump_markdown_note,
     extract_wikilink_id,
     parse_raw_artifact,
     validate_artifact_content,
 )
 from m37.verify import build_blind_qa_allowlist, verify_finding_phase_a
+
+HARNESS_AUDITOR_ALIAS = "harness_subagente"
+HARNESS_AUDITOR_FAMILY = "harness_no_verificable"
+MAX_KERNEL_QA_BUDGET_USD = 2.0
+
+
+def _approved_node_ids(enc_dir: Path) -> set[str]:
+    plan_path = enc_dir / "01_Plan.md"
+    if not plan_path.is_file():
+        return set()
+    plan_meta, _ = parse_raw_artifact(plan_path.read_text(encoding="utf-8"), suffix=".md")
+    return {extract_wikilink_id(str(n)) for n in (plan_meta.get("nodos") or [])}
+
+
+def _open_engagement(paths: WorkspacePaths, id_encargo: str, *, need_gate_2: bool) -> tuple[BriefContract, dict[str, str]]:
+    """Common entry check for every tool that produces or audits engagement work through this server."""
+    enc_dir = paths.engagement_dir(id_encargo)
+    brief_obj = gates.assert_gate_1(enc_dir)
+    if need_gate_2:
+        gates.assert_gate_2(enc_dir)
+    env = load_effective_env()
+    # NA4: the privacy gate applies to the host harness too — its model sees everything the agent reads.
+    check_privacy_gate(brief_obj.nivel_rigor, env)
+    return brief_obj, env
 
 
 def _load_reindex_module() -> Any:
@@ -82,14 +124,10 @@ def m37_workspace_status(vault: str | None = None) -> dict[str, Any]:
             if brief_file.is_file():
                 try:
                     b_meta, b_body = parse_raw_artifact(brief_file.read_text(encoding="utf-8"), suffix=".md")
-                    live_b_sha = compute_brief_substantive_sha256(b_meta, b_body)
                     enc_info["cliente"] = b_meta.get("cliente")
                     enc_info["nivel_rigor"] = b_meta.get("nivel_rigor")
                     enc_info["puerta_1_aprobada"] = bool(b_meta.get("puerta_1_aprobada"))
-                    enc_info["puerta_1_sha256_valida"] = (
-                        bool(b_meta.get("puerta_1_aprobada"))
-                        and b_meta.get("puerta_1_sha256") in (None, live_b_sha)
-                    )
+                    enc_info["puerta_1_sha256_valida"] = gates.evaluate_gate_1(b_meta, b_body)[0]
                 except Exception as exc:  # noqa: BLE001
                     enc_info["brief_error"] = str(exc)
             nodos_dir = edir / "Nodos"
@@ -112,12 +150,9 @@ def m37_workspace_status(vault: str | None = None) -> dict[str, Any]:
             if plan_file.is_file():
                 try:
                     pm, pb = parse_raw_artifact(plan_file.read_text(encoding="utf-8"), suffix=".md")
-                    live_p_sha = compute_plan_dag_sha256(pm, pb, node_files)
                     enc_info["puerta_2_aprobada"] = bool(pm.get("puerta_2_aprobada"))
-                    enc_info["puerta_2_sha256_valida"] = (
-                        bool(pm.get("puerta_2_aprobada"))
-                        and pm.get("puerta_2_sha256") in (None, live_p_sha)
-                    )
+                    enc_info["puerta_2_sha256_valida"] = gates.evaluate_gate_2(edir)[0]
+                    enc_info["modo_ejecucion"] = pm.get("modo_ejecucion", "api")
                 except Exception as exc:  # noqa: BLE001
                     enc_info["plan_error"] = str(exc)
             h_dir = edir / "Hallazgos"
@@ -152,18 +187,16 @@ def m37_init_or_new_engagement(
     rigor: str = "L3",
     pregunta: str = "¿Cuál es la recomendación óptima sustentada en evidencia verificable?",
     clean_l4: bool = False,
-    approve_gate_1: bool = False,
 ) -> dict[str, Any]:
-    """Inicializa un workspace M37 (si no existe) y opcionalmente crea un nuevo encargo y su contrato 00_Brief.md."""
+    """Inicializa un workspace M37 (si no existe) y opcionalmente crea un encargo y su 00_Brief.md. La Puerta 1 la aprueba una persona con `m37 approve`."""
     target_root = Path(vault).expanduser().resolve() if vault else resolve_workspace_paths(None).workspace_root
     paths = WorkspacePaths.from_root(target_root)
     initialized = False
     if not (paths.vault_root / "00_Sistema").is_dir():
-        paths = init_workspace(target_root, clean_l4=clean_l4, force=True)
+        paths = init_workspace(target_root, clean_l4=clean_l4, force=False)
         initialized = True
 
     brief_path_str: str | None = None
-    puerta_1_sha: str | None = None
     if id_encargo:
         brief_path = create_new_engagement(
             paths,
@@ -172,12 +205,6 @@ def m37_init_or_new_engagement(
             rigor=rigor,  # type: ignore[arg-type]
             pregunta=pregunta,
         )
-        if approve_gate_1:
-            b_meta, b_body = parse_raw_artifact(brief_path.read_text(encoding="utf-8"), suffix=".md")
-            puerta_1_sha = compute_brief_substantive_sha256(b_meta, b_body)
-            b_meta["puerta_1_aprobada"] = True
-            b_meta["puerta_1_sha256"] = puerta_1_sha
-            write_utf8_lf(brief_path, dump_markdown_note(b_meta, b_body))
         brief_path_str = str(brief_path)
 
     return {
@@ -186,26 +213,26 @@ def m37_init_or_new_engagement(
         "workspace_inicializado_ahora": initialized,
         "id_encargo": id_encargo,
         "brief_path": brief_path_str,
-        "puerta_1_aprobada": approve_gate_1,
-        "puerta_1_sha256": puerta_1_sha,
+        "puerta_1_aprobada": False,
+        "siguiente_paso_humano": (
+            f"Pide a la persona que revise 00_Brief.md y ejecute en su terminal: m37 approve {id_encargo} --gate 1"
+            if id_encargo
+            else None
+        ),
     }
 
 
 def m37_plan_engagement(
     id_encargo: str,
     arquetipo: str = "ARQ_Diagnostico-Cualitativo",
-    approve_gate_1: bool = False,
-    approve_gate_2: bool = False,
     vault: str | None = None,
 ) -> dict[str, Any]:
-    """Compila 01_Plan.md y Nodos/N-*.md desde un Arquetipo declarativo (0 tokens LLM de API externa; compatible con plan topado del harness)."""
+    """Compila 01_Plan.md y Nodos/N-*.md desde un Arquetipo declarativo en modo harness. Requiere Puerta 1 sellada; la Puerta 2 la aprueba una persona con `m37 approve`."""
     paths = resolve_workspace_paths(vault)
     plan_path, node_paths = generate_plan_from_archetype(
         paths,
         id_encargo,
         archetype_name=arquetipo,
-        approve_gate_1=approve_gate_1,
-        approve_gate_2=approve_gate_2,
         harness_mode=True,
     )
     nodos_summary: list[dict[str, Any]] = []
@@ -217,19 +244,22 @@ def m37_plan_engagement(
                 "ruta": np.relative_to(paths.workspace_root).as_posix(),
                 "perfil_herramientas": nm.get("perfil_herramientas"),
                 "rol_tarea": nm.get("rol_tarea"),
+                "requiere_computo": nm.get("requiere_computo", False),
                 "depende_de": nm.get("depende_de", []),
                 "artefactos_requeridos": nm.get("artefactos_requeridos", []),
                 "entregables_esperados": nm.get("entregables_esperados", []),
             }
         )
-    pm, _ = parse_raw_artifact(plan_path.read_text(encoding="utf-8"), suffix=".md")
     return {
         "id_encargo": id_encargo,
         "plan_path": plan_path.relative_to(paths.workspace_root).as_posix(),
         "arquetipo_base": arquetipo,
-        "puerta_2_aprobada": bool(pm.get("puerta_2_aprobada")),
-        "puerta_2_sha256": pm.get("puerta_2_sha256"),
+        "modo_ejecucion": "harness",
+        "puerta_2_aprobada": False,
         "nodos": nodos_summary,
+        "siguiente_paso_humano": (
+            f"Pide a la persona que revise 01_Plan.md y Nodos/ y ejecute en su terminal: m37 approve {id_encargo} --gate 2"
+        ),
     }
 
 
@@ -246,91 +276,85 @@ def m37_write_artifact(
     """Ejecuta una acción custodiada por ExecutionGuard (write_note, write_script, run_python_sandbox, run_verification_sandbox, web_fetch_clean)."""
     paths = resolve_workspace_paths(vault)
     enc_dir = paths.engagement_dir(id_encargo)
-    brief_path = enc_dir / "00_Brief.md"
-    if not brief_path.is_file():
-        raise FileNotFoundError(f"No existe 00_Brief.md para el encargo {id_encargo!r}")
-    brief_obj, _, _ = validate_artifact_content(
-        brief_path.read_text(encoding="utf-8"),
-        suffix=".md",
-        expected_tipo="brief",
-    )
-    assert isinstance(brief_obj, BriefContract)
+    brief_obj, env = _open_engagement(paths, id_encargo, need_gate_2=True)
 
-    profile: Any = "analitico"
-    allow_compute = True
-    node_file = enc_dir / "Nodos" / f"{node_id}.md"
-    if node_file.is_file():
-        node_obj, _, _ = validate_artifact_content(
-            node_file.read_text(encoding="utf-8"),
-            suffix=".md",
-            expected_tipo="nodo",
+    # NA1: the profile is whatever the human-approved node says. The node must be listed in 01_Plan.md, because only
+    # those node files are covered by the Puerta 2 hash: a stray Nodos/N-99.md dropped on disk carries no approval.
+    bare_node = extract_wikilink_id(node_id)
+    node_file = enc_dir / "Nodos" / f"{bare_node}.md"
+    if bare_node not in _approved_node_ids(enc_dir) or not node_file.is_file():
+        raise PermissionError(
+            f"node_id {node_id!r} no corresponde a ningún nodo de 01_Plan.md; cada acción debe ejecutarse bajo un nodo aprobado."
         )
-        assert isinstance(node_obj, NodeContract)
-        profile = node_obj.perfil_herramientas
-        allow_compute = bool(node_obj.requiere_computo)
-    elif node_id.upper().startswith("ORQ"):
-        profile = "orquestador"
+    node_obj, _, _ = validate_artifact_content(
+        node_file.read_text(encoding="utf-8"),
+        suffix=".md",
+        expected_tipo="nodo",
+    )
+    assert isinstance(node_obj, NodeContract)
 
     act = action.strip().lower()
-    if act in (
-        "write_script",
-        "write_sandbox_script",
-        "escribir_script",
-        "run_python_sandbox",
-        "run_sandbox_script",
-        "ejecutar_python_sandbox",
-    ) or "/Derivaciones/" in path.replace("\\", "/"):
-        allow_compute = True
-
     guard = ExecutionGuard(
         paths,
         AgentExecutionContext(
             engagement_id=id_encargo,
             client_id=brief_obj.cliente,
-            node_id=node_id,
-            profile=profile,
-            allow_compute=allow_compute,
+            node_id=node_obj.id,
+            profile=node_obj.perfil_herramientas,
+            model_alias="harness_anfitrion",
+            model_family=HARNESS_AUDITOR_FAMILY,
+            allow_compute=bool(node_obj.requiere_computo),
+            env_secrets=extract_secret_values(env),
+            base_env=env,
+            web_allowed_domains=tuple(brief_obj.dominios_web_permitidos),
+            web_requires_allowlist=brief_obj.nivel_rigor in ("L3", "L4"),
         ),
     )
 
-    if act in ("write_reference_snapshot", "escribir_snapshot"):
-        ref_root = (paths.referencias_root / id_encargo).resolve()
-        ref_root.mkdir(parents=True, exist_ok=True)
-        raw_p = Path(path)
-        if raw_p.is_absolute():
-            target_snap = raw_p.resolve()
-        elif raw_p.parts and raw_p.parts[0] == "referencias":
-            target_snap = (paths.workspace_root / raw_p).resolve()
-        else:
-            target_snap = (ref_root / raw_p).resolve()
-        if paths.referencias_root.resolve() not in target_snap.parents:
-            raise PermissionError("Los snapshots locales deben ubicarse dentro de referencias/.")
-        write_utf8_lf(target_snap, content)
-        rel_snap = target_snap.relative_to(paths.workspace_root.resolve()).as_posix()
-        return {"ok": True, "action": "write_reference_snapshot", "path": rel_snap}
+    def _log(result_path: str | None) -> None:
+        append_episodic_event(
+            paths.episodios_path(),
+            {
+                "evento": "harness_accion",
+                "encargo": id_encargo,
+                "nodo": node_obj.id,
+                "perfil": node_obj.perfil_herramientas,
+                "accion": act,
+                "ruta": result_path,
+            },
+        )
+
     if act in ("write_note", "escribir_nota"):
         written = guard.write_note(path, content)
+        _log(written)
         return {"ok": True, "action": "write_note", "path": written}
     if act in ("write_script", "write_sandbox_script", "escribir_script"):
         written = guard.write_sandbox_script(path, content)
+        _log(written)
         return {"ok": True, "action": "write_script", "path": written}
     if act in ("write_code_file", "escribir_codigo"):
         written = guard.write_code_file(path, content)
+        _log(written)
         return {"ok": True, "action": "write_code_file", "path": written}
     if act in ("run_python_sandbox", "run_sandbox_script", "ejecutar_python_sandbox"):
         res = guard.run_sandbox_script(path)
+        _log(str(res.get("script")))
         return {"ok": res["exit_code"] == 0, "action": "run_python_sandbox", **res}
     if act in ("run_verification_sandbox", "run_verification_cmd", "ejecutar_verificacion_sandbox"):
         if not command:
             raise ValueError("Se requiere 'command' para run_verification_sandbox.")
         cmd_str = " ".join(command) if isinstance(command, list) else str(command)
         res = guard.run_verification_cmd(cmd_str)
+        _log(None)
         return {"ok": res["exit_code"] == 0, "action": "run_verification_sandbox", **res}
     if act == "web_fetch_clean":
         text = guard.web_fetch_clean(url or path)
+        _log(url or path)
         return {"ok": True, "action": "web_fetch_clean", "text": text}
     raise ValueError(
-        f"Acción desconocida {action!r}. Usa: write_note, write_script, write_code_file, run_python_sandbox, run_verification_sandbox o web_fetch_clean."
+        f"Acción desconocida {action!r}. Usa: write_note, write_script, write_code_file, run_python_sandbox, "
+        "run_verification_sandbox o web_fetch_clean. Los snapshots de fuentes solo entran por web_fetch_clean "
+        "(kernel) o `m37 ingest` (persona)."
     )
 
 
@@ -340,17 +364,11 @@ def m37_prepare_blind_qa(
     ronda: int = 1,
     vault: str | None = None,
 ) -> dict[str, Any]:
-    """Ejecuta Fase A mecánica sobre un Hallazgo y, si aprueba, devuelve la allowlist estricta y el prompt aislado para el subagente m37-qa-ciego."""
+    """Ejecuta Fase A mecánica sobre un Hallazgo y devuelve la allowlist y el prompt para el subagente m37-qa-ciego. En L3/L4 ese veredicto es consultivo: el válido sale de m37_run_kernel_qa o de `m37 bless`."""
     paths = resolve_workspace_paths(vault)
+    brief_obj, _ = _open_engagement(paths, id_encargo, need_gate_2=True)
     clean_hid = extract_wikilink_id(id_hallazgo)
     finding_path = resolve_artifact_by_id(paths, id_encargo, clean_hid)
-    enc_dir = paths.engagement_dir(id_encargo)
-    brief_obj, _, _ = validate_artifact_content(
-        (enc_dir / "00_Brief.md").read_text(encoding="utf-8"),
-        suffix=".md",
-        expected_tipo="brief",
-    )
-    assert isinstance(brief_obj, BriefContract)
 
     phase_a = verify_finding_phase_a(paths, id_encargo, finding_path, rigor=brief_obj.nivel_rigor)
     if not phase_a.passed:
@@ -366,17 +384,17 @@ def m37_prepare_blind_qa(
     finding_sha = compute_finding_substantive_sha256(f_meta, f_body)
     allowlist_paths = sorted(build_blind_qa_allowlist(paths, id_encargo, finding_path, ronda=int(ronda)))
     rel_allowlist = [p.relative_to(paths.workspace_root).as_posix() for p in allowlist_paths]
-    next_verdict_id = allocate_next_id(paths, "V", engagement_id=id_encargo)
+    needs_attested = brief_obj.nivel_rigor in ("L3", "L4")
 
     subagent_prompt = (
         f"Actúa como Auditor Adversarial de QA Ciego (`m37-qa-ciego`) en Ronda {ronda} para el Hallazgo `{clean_hid}` "
         f"del encargo `{id_encargo}` (nivel de rigor `{brief_obj.nivel_rigor}`).\n\n"
-        "REGLA DE AISLAMIENTO ESTRICTO (BLIND QA):\n"
-        "1. Tienes PROHIBIDO leer `01_Plan.md`, `Nodos/N-*.md`, `Entregables/*.md`, `90_Bitacora/` o cualquier archivo fuera de esta lista blanca exacta:\n"
+        "REGLA DE AISLAMIENTO (BLIND QA):\n"
+        "1. Lee únicamente los archivos de esta lista; no abras `01_Plan.md`, `Nodos/N-*.md`, `Entregables/*.md` ni `90_Bitacora/`:\n"
         + "\n".join(f"   - `{rel}`" for rel in rel_allowlist)
         + "\n2. Audita únicamente el Hallazgo y sus fuentes/derivaciones listadas arriba.\n"
         "3. Formula tu `mejor_ataque` adversarial obligatorio y clasifica cualquier defecto con "
-        "`id_defecto`, `severidad` (`bloqueante|mayor|menor`), `categoria`, `exige_cambio_material`, `ubicacion`, `evidencia` y `remediacion`.\n"
+        "`id_defecto`, `severidad` (`bloqueante|mayor|menor|sugerencia`), `categoria`, `exige_cambio_material`, `ubicacion`, `evidencia` y `remediacion`.\n"
         "4. Registra el veredicto llamando a la herramienta MCP `m37_record_qa_verdict`."
     )
 
@@ -386,9 +404,15 @@ def m37_prepare_blind_qa(
         "id_hallazgo": clean_hid,
         "ronda": ronda,
         "sha256_hallazgo_auditado": finding_sha,
-        "next_verdict_id": next_verdict_id,
         "allowlist_files": rel_allowlist,
         "subagent_prompt": subagent_prompt,
+        "veredicto_subagente_es_consultivo": needs_attested,
+        "nota": (
+            "En L3/L4 el veredicto del subagente del harness no habilita la compilación: el kernel no puede verificar "
+            "que fue ciego ni de otra familia. Usa m37_run_kernel_qa o pide a la persona `m37 bless`."
+            if needs_attested
+            else "En L1/L2 el veredicto del subagente actualiza estado_qa, registrado como no atestiguado."
+        ),
     }
 
 
@@ -401,22 +425,15 @@ def m37_record_qa_verdict(
     resolucion_ronda_previa: dict[str, str] | None = None,
     dictamen_markdown: str = "",
     ronda: int = 1,
-    modelo_auditor: str = "harness_subagent_qa",
-    familia_auditor: str = "harness_qa",
     node_id: str | None = None,
     vault: str | None = None,
 ) -> dict[str, Any]:
-    """Registra un veredicto de QA Ciego (QA/V-*.md) ligado criptográficamente al SHA-256 sustantivo del Hallazgo y actualiza su estado."""
+    """Registra el veredicto de un subagente del harness (QA/V-*.md) ligado al SHA-256 del Hallazgo. Queda marcado como NO atestiguado: el kernel no puede verificar ni ceguera ni familia del auditor."""
     paths = resolve_workspace_paths(vault)
+    brief_obj, env = _open_engagement(paths, id_encargo, need_gate_2=True)
     clean_hid = extract_wikilink_id(id_hallazgo)
     finding_path = resolve_artifact_by_id(paths, id_encargo, clean_hid)
     enc_dir = paths.engagement_dir(id_encargo)
-    brief_obj, _, _ = validate_artifact_content(
-        (enc_dir / "00_Brief.md").read_text(encoding="utf-8"),
-        suffix=".md",
-        expected_tipo="brief",
-    )
-    assert isinstance(brief_obj, BriefContract)
 
     phase_a = verify_finding_phase_a(paths, id_encargo, finding_path, rigor=brief_obj.nivel_rigor)
     if not phase_a.passed:
@@ -430,6 +447,24 @@ def m37_record_qa_verdict(
     assert isinstance(f_obj, FindingContract)
     finding_sha = compute_finding_substantive_sha256(f_meta, f_body)
 
+    # No verdict shopping: identical content that was already rejected is not re-audited until it changes.
+    qa_dir = enc_dir / "QA"
+    if qa_dir.is_dir():
+        for vfile in qa_dir.glob("V-*.md"):
+            try:
+                vm, _ = parse_raw_artifact(vfile.read_text(encoding="utf-8"), suffix=".md")
+            except Exception:  # noqa: BLE001
+                continue
+            if (
+                extract_wikilink_id(str(vm.get("artefacto_auditado") or "")) == clean_hid
+                and vm.get("sha256_artefacto_auditado") == finding_sha
+                and vm.get("decision") == "rechazar"
+            ):
+                raise PermissionError(
+                    f"{clean_hid} ya fue rechazado con este mismo contenido ({vm.get('id')}); remedia el hallazgo "
+                    "antes de pedir otro veredicto."
+                )
+
     allowlist_paths = sorted(build_blind_qa_allowlist(paths, id_encargo, finding_path, ronda=int(ronda)))
     verdict_id = allocate_next_id(paths, "V", engagement_id=id_encargo)
     verdict_rel = f"vault/20_Encargos/{id_encargo}/QA/{verdict_id}.md"
@@ -440,8 +475,8 @@ def m37_record_qa_verdict(
         "encargo": id_encargo,
         "artefacto_auditado": f"[[{clean_hid}]]",
         "ronda": int(ronda),
-        "modelo_auditor": modelo_auditor,
-        "familia_auditor": familia_auditor,
+        "modelo_auditor": HARNESS_AUDITOR_ALIAS,
+        "familia_auditor": HARNESS_AUDITOR_FAMILY,
         "fase_a_mecanica": "aprobada",
         "mejor_ataque": mejor_ataque,
         "hallazgos_critica": hallazgos_critica or [],
@@ -452,7 +487,11 @@ def m37_record_qa_verdict(
 
     body_text = dictamen_markdown.strip()
     if not body_text.startswith("## Dictamen"):
-        body_text = f"## Dictamen Ronda {ronda}\n\n" + (body_text or f"Decisión de auditoría ciega: `{decision}`.")
+        body_text = f"## Dictamen Ronda {ronda}\n\n" + (body_text or f"Decisión de auditoría: `{decision}`.")
+    body_text += (
+        "\n\n> Veredicto emitido por un subagente del harness anfitrión. El kernel no medió sus lecturas ni eligió "
+        "su modelo: `revision_ciega_verificada: false`."
+    )
 
     verdict_content = dump_markdown_note(verdict_meta, body_text + "\n")
 
@@ -465,30 +504,50 @@ def m37_record_qa_verdict(
             profile="qa_ciego",
             blind_qa_allowlist=frozenset(allowlist_paths),
             assigned_qa_target=clean_hid,
-            model_alias=modelo_auditor,
-            model_family=familia_auditor,
+            # NC3: identity and blindness are stamped by the server, never taken from the caller.
+            model_alias=HARNESS_AUDITOR_ALIAS,
+            model_family=HARNESS_AUDITOR_FAMILY,
+            blindness_enforced=False,
+            base_env=env,
         ),
     )
     written_rel = qa_guard.write_note(verdict_rel, verdict_content)
 
-    # Update finding estado_qa deterministically
+    needs_attested = brief_obj.nivel_rigor in ("L3", "L4")
     accepted = decision in ("aceptar", "aceptar_con_correcciones")
-    if decision == "aceptar":
-        f_meta["estado_qa"] = "aprobado"
-    elif decision == "aceptar_con_correcciones":
-        f_meta["estado_qa"] = "aprobado_con_correcciones"
-    else:
+    if not accepted:
         f_meta["estado_qa"] = "rechazado"
+    elif needs_attested:
+        # An unattested acceptance cannot approve an L3/L4 finding.
+        f_meta["estado_qa"] = "pendiente"
+    else:
+        f_meta["estado_qa"] = "aprobado" if decision == "aceptar" else "aprobado_con_correcciones"
     write_utf8_lf(finding_path, dump_markdown_note(f_meta, f_body))
 
-    if node_id:
-        node_file = enc_dir / "Nodos" / f"{node_id}.md"
+    if node_id and extract_wikilink_id(node_id) in _approved_node_ids(enc_dir):
+        node_file = enc_dir / "Nodos" / f"{extract_wikilink_id(node_id)}.md"
         if node_file.is_file():
             nm, nb = parse_raw_artifact(node_file.read_text(encoding="utf-8"), suffix=".md")
-            nm["rondas_qa"] = int(ronda)
-            nm["estado"] = "aceptado" if accepted else ("escalado_humano" if int(ronda) >= 2 else "en_qa")
+            nm["rondas_qa"] = min(int(ronda), 2)
+            if accepted and not needs_attested:
+                nm["estado"] = "aceptado"
+            elif accepted:
+                nm["estado"] = "en_qa"
+            else:
+                nm["estado"] = "escalado_humano" if int(ronda) >= 2 else "rechazado_r1"
             write_utf8_lf(node_file, dump_markdown_note(nm, nb))
 
+    append_episodic_event(
+        paths.episodios_path(),
+        {
+            "evento": "harness_veredicto_no_atestiguado",
+            "encargo": id_encargo,
+            "hallazgo": clean_hid,
+            "veredicto": verdict_id,
+            "ronda": int(ronda),
+            "decision": decision,
+        },
+    )
     return {
         "ok": True,
         "verdict_id": verdict_id,
@@ -497,7 +556,33 @@ def m37_record_qa_verdict(
         "decision": decision,
         "estado_qa_hallazgo": f_meta["estado_qa"],
         "sha256_hallazgo_auditado": finding_sha,
+        "atestiguado": False,
+        "siguiente_paso": (
+            "Rigor L3/L4: ejecuta m37_run_kernel_qa (QA del kernel con otra familia) o pide a la persona `m37 bless`."
+            if needs_attested and accepted
+            else None
+        ),
     }
+
+
+def m37_run_kernel_qa(
+    id_encargo: str,
+    id_hallazgo: str,
+    presupuesto_usd: float = 0.75,
+    vault: str | None = None,
+) -> dict[str, Any]:
+    """QA ciego ejecutado por el kernel vía API con un modelo de familia distinta a la del harness (M37_HARNESS_FAMILY en .env). Único QA automático atestiguable (revision_ciega_verificada: true). Requiere una API key de otro proveedor en .env."""
+    paths = resolve_workspace_paths(vault)
+    budget = max(0.01, min(float(presupuesto_usd), MAX_KERNEL_QA_BUDGET_USD))
+    # The author's family is read from the operator's environment inside run_kernel_blind_qa. Letting the agent
+    # declare it would let it pick a same-family auditor by misreporting its own.
+    return run_kernel_blind_qa(
+        paths,
+        id_encargo,
+        id_hallazgo,
+        author_family=None,
+        budget_max_usd=budget,
+    )
 
 
 def m37_verify_and_compile(
@@ -594,7 +679,6 @@ MCP_TOOL_CATALOG: list[dict[str, Any]] = [
                 "rigor": {"type": "string", "enum": ["L1", "L2", "L3", "L4"], "default": "L3"},
                 "pregunta": {"type": "string"},
                 "clean_l4": {"type": "boolean", "default": False},
-                "approve_gate_1": {"type": "boolean", "default": False},
             },
         },
     },
@@ -606,8 +690,6 @@ MCP_TOOL_CATALOG: list[dict[str, Any]] = [
             "properties": {
                 "id_encargo": {"type": "string"},
                 "arquetipo": {"type": "string", "default": "ARQ_Diagnostico-Cualitativo"},
-                "approve_gate_1": {"type": "boolean", "default": False},
-                "approve_gate_2": {"type": "boolean", "default": False},
                 "vault": {"type": "string"},
             },
             "required": ["id_encargo"],
@@ -620,12 +702,16 @@ MCP_TOOL_CATALOG: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "id_encargo": {"type": "string"},
-                "node_id": {"type": "string", "description": "ID del nodo ejecutor (ej. N-01, N-02, ORQ-01)."},
+                "node_id": {
+                    "type": "string",
+                    "description": "ID de un nodo existente de 01_Plan.md (ej. N-01). Su perfil y requiere_computo deciden qué se permite.",
+                },
                 "action": {
                     "type": "string",
                     "enum": [
                         "write_note",
                         "write_script",
+                        "write_code_file",
                         "run_python_sandbox",
                         "run_verification_sandbox",
                         "web_fetch_clean",
@@ -671,12 +757,24 @@ MCP_TOOL_CATALOG: list[dict[str, Any]] = [
                 "resolucion_ronda_previa": {"type": "object"},
                 "dictamen_markdown": {"type": "string"},
                 "ronda": {"type": "integer", "default": 1},
-                "modelo_auditor": {"type": "string", "default": "harness_subagent_qa"},
-                "familia_auditor": {"type": "string", "default": "harness_qa"},
                 "node_id": {"type": "string"},
                 "vault": {"type": "string"},
             },
             "required": ["id_encargo", "id_hallazgo", "decision", "mejor_ataque"],
+        },
+    },
+    {
+        "name": "m37_run_kernel_qa",
+        "description": m37_run_kernel_qa.__doc__,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id_encargo": {"type": "string"},
+                "id_hallazgo": {"type": "string"},
+                "presupuesto_usd": {"type": "number", "default": 0.75},
+                "vault": {"type": "string"},
+            },
+            "required": ["id_encargo", "id_hallazgo"],
         },
     },
     {
@@ -746,6 +844,7 @@ TOOL_DISPATCH: dict[str, Any] = {
     "m37_write_artifact": m37_write_artifact,
     "m37_prepare_blind_qa": m37_prepare_blind_qa,
     "m37_record_qa_verdict": m37_record_qa_verdict,
+    "m37_run_kernel_qa": m37_run_kernel_qa,
     "m37_verify_and_compile": m37_verify_and_compile,
     "fuentes_por_vencer": fuentes_por_vencer,
     "desempeno_empirico_modelos": desempeno_empirico_modelos,
@@ -786,7 +885,27 @@ def handle_jsonrpc_request(req: dict[str, Any], *, vault: str | None = None) -> 
         params = req.get("params") or {}
         name = params.get("name")
         args = dict(params.get("arguments") or {})
-        if vault and not args.get("vault"):
+        if vault:
+            requested = args.get("vault")
+            if requested:
+                same = (
+                    WorkspacePaths.from_root(str(requested)).workspace_root
+                    == WorkspacePaths.from_root(vault).workspace_root
+                )
+                if not same:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Error: este servidor está fijado a un workspace; el argumento `vault` no puede apuntar a otro.",
+                                }
+                            ],
+                            "isError": True,
+                        },
+                    }
             args["vault"] = vault
         fn = TOOL_DISPATCH.get(str(name))
         if fn is None:
@@ -821,8 +940,20 @@ def handle_jsonrpc_request(req: dict[str, Any], *, vault: str | None = None) -> 
     }
 
 
+def _parse_request(raw: bytes) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return (request, error_response). Malformed input yields a JSON-RPC parse error instead of an exception."""
+    try:
+        req = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {exc}"}}
+    if not isinstance(req, dict):
+        return None, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+    return req, None
+
+
 def run_stdio_server(vault: str | None = None) -> None:
     """Universal stdio loop supporting both newline-delimited JSON-RPC 2.0 and Content-Length framed JSON-RPC."""
+    effective_vault = vault or (load_effective_env().get("M37_VAULT") or None)
     stdin_buf = sys.stdin.buffer
     stdout_buf = sys.stdout.buffer
     while True:
@@ -832,27 +963,29 @@ def run_stdio_server(vault: str | None = None) -> None:
         stripped = first_line.strip()
         if not stripped:
             continue
-        if stripped.lower().startswith(b"content-length:"):
-            length = int(stripped.split(b":", 1)[1].strip())
+        framed = stripped.lower().startswith(b"content-length:")
+        if framed:
+            try:
+                length = int(stripped.split(b":", 1)[1].strip())
+            except ValueError:
+                continue
             while True:
                 hdr = stdin_buf.readline()
                 if not hdr or hdr in (b"\r\n", b"\n"):
                     break
-            body = stdin_buf.read(length)
-            req = json.loads(body.decode("utf-8"))
-            resp = handle_jsonrpc_request(req, vault=vault)
-            if resp is not None:
-                out_bytes = json.dumps(resp, ensure_ascii=False).encode("utf-8")
-                header = f"Content-Length: {len(out_bytes)}\r\n\r\n".encode("ascii")
-                stdout_buf.write(header + out_bytes)
-                stdout_buf.flush()
+            payload = stdin_buf.read(length)
         else:
-            req = json.loads(stripped.decode("utf-8"))
-            resp = handle_jsonrpc_request(req, vault=vault)
-            if resp is not None:
-                out_bytes = (json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8")
-                stdout_buf.write(out_bytes)
-                stdout_buf.flush()
+            payload = stripped
+        req, err = _parse_request(payload)
+        resp = err if req is None else handle_jsonrpc_request(req, vault=effective_vault)
+        if resp is None:
+            continue
+        out_bytes = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+        if framed:
+            stdout_buf.write(f"Content-Length: {len(out_bytes)}\r\n\r\n".encode("ascii") + out_bytes)
+        else:
+            stdout_buf.write(out_bytes + b"\n")
+        stdout_buf.flush()
 
 
 if __name__ == "__main__":

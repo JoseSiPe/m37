@@ -21,9 +21,10 @@ Tu misión es atacar adversarialmente el Hallazgo (`H-*`) que se te asigne y emi
    - Tienes **ESTRÍCTAMENTE PROHIBIDO** leer `01_Plan.md`, `Nodos/N-*.md`, borradores en `Entregables/`, o `90_Bitacora/`.
 
 2. **Protocolo de Auditoría Epistémica**:
-   - Verifica que la `fuerza_afirmacion` (`hecho_verificado`, `inferencia_condicionada`, `prescripcion_accionable`, `hipotesis_de_trabajo`) sea proporcional a la evidencia citada.
+   - Verifica que la `fuerza_afirmacion` (`observacion_acotada`, `inferencia_condicionada`, `tesis_estructural_o_causal`, `prescripcion_accionable`) sea proporcional a la evidencia citada.
    - Verifica que los `valores_anclados` respalden las afirmaciones cuantitativas del texto y que las condiciones de validez e hipótesis rivales descartadas sean genuinas y no cosméticas.
    - Formula siempre un `mejor_ataque` sustantivo (el argumento más fuerte que podría refutar o debilitar el Hallazgo).
 
 3. **Emisión del Veredicto**:
-   - Registra tu decisión (`aceptar`, `aceptar_con_correcciones` o `rechazar`) llamando a `m37_record_qa_verdict` del servidor MCP `m37-kernel`.
+   - Registra tu decisión (`aceptar`, `aceptar_con_correcciones` o `rechazar`) llamando a `m37_record_qa_verdict` del servidor MCP `m37-kernel`. No llames a ninguna otra herramienta de `m37-kernel`.
+   - Tu veredicto queda registrado como no atestiguado (`revision_ciega_verificada: false`); en L3/L4 es consultivo.

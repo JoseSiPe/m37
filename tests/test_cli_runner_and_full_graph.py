@@ -22,6 +22,7 @@ from m37.cli import (
 )
 from m37.compiler import compile_deliverable
 from m37.config import PrivacyGateError, get_core_repo_root
+from m37.gates import approve_gate
 from m37.guards import write_utf8_lf
 from m37.schemas import dump_markdown_note, parse_raw_artifact
 
@@ -500,6 +501,10 @@ def test_noop_and_max_turns_nodes_escalate_and_block_dag(tmp_path: Path) -> None
     n_meta["estado"] = "pendiente"
     n_meta["enrutamiento_modelo"]["max_turns"] = 2
     write_utf8_lf(n01_path, dump_markdown_note(n_meta, n_body))
+    # A4: cambiar el ruteo de un nodo invalida Puerta 2; un humano debe volver a sellarla.
+    with pytest.raises(PermissionError, match="Puerta 2 invalidada"):
+        run_engagement(ws, "ENC-NOOP-01", target_node_id="N-01", env=paid_env, completion_fn=_noop_llm)
+    approve_gate(ws, "ENC-NOOP-01", 2)
 
     def _infinite_tool_llm(*, model: str, messages: list[dict[str, Any]], tools: Any = None, **kwargs: Any) -> dict[str, Any]:
         return {
@@ -590,6 +595,7 @@ def test_task_and_editorial_agents_blocked_from_episodic_memory_and_duckdb_index
 
 def test_declarative_archetype_router_rigor_context_and_episodic_penalty_and_orchestrator_flag(
     tmp_path: Path,
+    human_at_terminal: None,
 ) -> None:
     """Regresión Hallazgo 3 (Alto): Arquetipos 100% declarativos, ruteo sensible a L1..L4/contexto/rechazo QA >35% y flag --orchestrator."""
     from typer.testing import CliRunner
@@ -763,6 +769,7 @@ def test_shared_node_budget_across_r1_qa1_r2_qa2_and_full_episodic_schema(tmp_pa
     n_meta["depende_de"] = []  # Permitir correr N-02 directamente en la prueba
     n_meta["enrutamiento_modelo"]["presupuesto_max_usd"] = 0.09
     write_utf8_lf(n02_path, dump_markdown_note(n_meta, n_body))
+    approve_gate(ws, "ENC-BUD-01", 2)  # A4: presupuesto y dependencias están cubiertos por el hash de Puerta 2
 
     exec_count = {"n02": 0}
 

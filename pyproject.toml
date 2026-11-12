@@ -34,19 +34,34 @@ data = [
 ]
 dev = [
     "pytest>=8.2.0",
+    "ruff>=0.6.0",
 ]
 
 [project.scripts]
 m37 = "m37.cli:app"
 m37-mcp = "m37.mcp_server:run_stdio_server"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+# M7: starter_vault/ y extensions/ viajan dentro del wheel como datos del paquete (m37/_starter_vault, m37/_extensions),
+# de modo que `pip install m37` funcione sin el checkout del repositorio. En el repo siguen viviendo en la raíz.
+[tool.setuptools]
+packages = ["m37", "m37._starter_vault", "m37._extensions"]
+
+[tool.setuptools.package-dir]
+"m37" = "src/m37"
+"m37._starter_vault" = "starter_vault"
+"m37._extensions" = "extensions"
 
 [tool.setuptools.package-data]
-m37 = ["py.typed"]
+"m37._starter_vault" = ["**/*"]
+"m37._extensions" = ["**/*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["__pycache__/*", "*.pyc", "**/__pycache__/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
 addopts = "-q"
+markers = [
+    "strict_isolation: el test verifica la regla de un cliente por workspace y no recibe la excepción de compatibilidad",
+]

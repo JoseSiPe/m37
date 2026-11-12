@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Instalar
+        run: python -m pip install -e ".[dev,full]"
+      - name: Lint (errores reales)
+        run: python -m ruff check src extensions tests --select F
+      - name: Tests
+        run: python -m pytest -q
+
+  wheel:
+    name: wheel instalable fuera del repo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Construir e instalar el wheel en un entorno limpio
+        run: |
+          python -m pip wheel . --no-deps -w dist
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+      - name: init + compile del DEMO sin el checkout
+        run: |
+          cd /tmp
+          /tmp/clean/bin/m37 init /tmp/ws_ci
+          /tmp/clean/bin/m37 compile DEMO-01_entrada-mercado --vault /tmp/ws_ci --format html

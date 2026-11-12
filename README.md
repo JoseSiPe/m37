@@ -1,5 +1,7 @@
 # M37 (Move 37) — Microkernel Agéntico Agnóstico para Consultoría de Alto Rigor
 
+> **Aviso (rama de remediación):** el flujo de puertas humanas, snapshots de fuentes, QA en L3/L4, sandbox e instalador de plugins cambió respecto a lo que describe este README. Los cambios están en [`CHANGELOG.md`](CHANGELOG.md); este documento se reescribe en la Fase 3.
+
 **M37** (*Move 37*) es un microkernel agéntico en Python (`LiteLLM` + `Pydantic v2`) respaldado por un Vault Markdown compatible con Obsidian. Su núcleo es **100% agnóstico a disciplinas y proveedores de modelos**: ejecuta con las mismas garantías deterministas encargos de estrategia cualitativa, cumplimiento normativo, síntesis documental, modelado cuantitativo o ingeniería de software dirigida por especificaciones (`SDD + EARS + TDD`).
 
 ## Pilares Arquitectónicos

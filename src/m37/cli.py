@@ -15,10 +15,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from m37 import __version__
+from m37 import __version__, gates
 from m37.compiler import CompiledOutputs, CompilerAbortError, compile_deliverable
 from m37.config import (
     GitLeakSafetyError,
+    ModelCatalogEntry,
     PrivacyGateError,
     WorkspacePaths,
     check_git_leak_safety,
@@ -31,11 +32,16 @@ from m37.config import (
     load_model_catalog,
     resolve_workspace_paths,
 )
+from m37.gates import approve_gate, evaluate_gate_1, evaluate_gate_2
 from m37.guards import (
+    PUBLIC_SNAPSHOT_DIRNAME,
     AgentExecutionContext,
+    ExecutionGuard,
     allocate_next_id,
     compute_inputs_hash,
+    count_real_clients_in_workspace,
     quarantine_artifact,
+    register_snapshot,
     resolve_artifact_by_id,
     write_utf8_lf,
 )
@@ -53,6 +59,7 @@ from m37.schemas import (
     BriefContract,
     ContractValidationError,
     FindingContract,
+    ModelRoutingSpec,
     NodeContract,
     PlanContract,
     QAVerdictContract,
@@ -83,9 +90,25 @@ app = typer.Typer(
 console = Console()
 
 
+SAFE_ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+DEMO_SNAPSHOT_REL = f"referencias/{PUBLIC_SNAPSHOT_DIRNAME}/orcs_2026_tabla_4_2.txt"
+
+
+def _validate_entity_id(value: str, label: str) -> str:
+    """B2: engagement and client IDs become directory names, lock names and regex fragments; keep them boring."""
+    cleaned = value.strip()
+    if not SAFE_ENTITY_ID_RE.fullmatch(cleaned) or ".." in cleaned:
+        raise ValueError(
+            f"{label} inválido ({value!r}): usa solo letras, dígitos, '-', '_' o '.', sin separadores de ruta."
+        )
+    return cleaned
+
+
 class ClientLeakInCapitalError(PermissionError):
     """Raised when attempting to promote a finding containing client names to 50_Capital/."""
 
+
+HARNESS_EXECUTOR_ALIAS = "harness_anfitrion"
 
 DEMO_ORCS_SNAPSHOT_TEXT = (
     "Observatorio Regional de Cadena de Suministro (ORCS) — Benchmark LatAm SaaS B2B Logístico 2026\n"
@@ -179,6 +202,8 @@ def init_workspace(
     """SPEC-01 §4 & SPEC-05 §3.3: Initialize workspace tree from starter_vault/."""
     dest_path = Path(destination).expanduser().resolve()
     paths = WorkspacePaths.from_root(dest_path)
+    # M6: refuse to create a workspace inside a git-tracked engine checkout (raises GitLeakSafetyError).
+    check_git_leak_safety(paths.workspace_root)
 
     if paths.vault_root.exists() and any(paths.vault_root.iterdir()) and not force:
         raise FileExistsError(
@@ -221,7 +246,7 @@ def init_workspace(
             paths.vault_root / "20_Encargos" / "DEMO-01_entrada-mercado",
             paths.vault_root / "30_Evidencia_Publica" / "E-202610-001.md",
             paths.analisis_root / "DEMO-01_entrada-mercado",
-            paths.referencias_root / "orcs_2026_tabla_4_2.txt",
+            paths.workspace_root / DEMO_SNAPSHOT_REL,
         ):
             if demo_target.is_dir():
                 shutil.rmtree(demo_target)
@@ -243,9 +268,10 @@ def _synchronize_demo_hashes(paths: WorkspacePaths) -> None:
     import json
     from m37.guards import sha256_file
 
-    # Write verifiable local snapshot for primary evidence E-202610-001 in referencias/orcs_2026_tabla_4_2.txt
-    snap_path = paths.referencias_root / "orcs_2026_tabla_4_2.txt"
+    # Write the SIMULATED source for E-202610-001 into the public snapshot pool and register it as demo material.
+    snap_path = paths.workspace_root / DEMO_SNAPSHOT_REL
     write_utf8_lf(snap_path, DEMO_ORCS_SNAPSHOT_TEXT)
+    register_snapshot(paths, snap_path, "demo_simulado", url="https://ejemplo.org/orcs-logistica-b2b-2026")
 
     # Write reproducible DCF script for DEMO-01 in analisis/DEMO-01_entrada-mercado/modelo_van.py
     demo_script_path = paths.analisis_root / demo_id / "modelo_van.py"
@@ -260,8 +286,9 @@ def _synchronize_demo_hashes(paths: WorkspacePaths) -> None:
     ev_demo_path = paths.vault_root / "30_Evidencia_Publica" / "E-202610-001.md"
     if ev_demo_path.is_file():
         ev_meta, ev_body = parse_raw_artifact(ev_demo_path.read_text(encoding="utf-8"), suffix=".md")
-        ev_meta["snapshot_local"] = "referencias/orcs_2026_tabla_4_2.txt"
+        ev_meta["snapshot_local"] = DEMO_SNAPSHOT_REL
         ev_meta["hash_snapshot"] = f"sha256:{sha256_file(snap_path)}"
+        ev_meta["origen_snapshot"] = "demo_simulado"
         write_utf8_lf(ev_demo_path, dump_markdown_note(ev_meta, ev_body))
 
     # Stamp puerta_1_sha256 on 00_Brief.md and puerta_2_sha256 on 01_Plan.md
@@ -270,6 +297,7 @@ def _synchronize_demo_hashes(paths: WorkspacePaths) -> None:
         b_meta, b_body = parse_raw_artifact(brief_path.read_text(encoding="utf-8"), suffix=".md")
         if b_meta.get("puerta_1_aprobada"):
             b_meta["puerta_1_sha256"] = compute_brief_substantive_sha256(b_meta, b_body)
+            b_meta["puerta_1_aprobado_por"] = "demo_simulado"
             write_utf8_lf(brief_path, dump_markdown_note(b_meta, b_body))
 
     plan_path = demo_dir / "01_Plan.md"
@@ -281,6 +309,7 @@ def _synchronize_demo_hashes(paths: WorkspacePaths) -> None:
                 for n in (p_meta.get("nodos") or [])
             ]
             p_meta["puerta_2_sha256"] = compute_plan_dag_sha256(p_meta, p_body, npaths)
+            p_meta["puerta_2_aprobado_por"] = "demo_simulado"
             write_utf8_lf(plan_path, dump_markdown_note(p_meta, p_body))
 
     # Refresh Derivation input sha256s and script producer hash
@@ -364,8 +393,30 @@ def inspect_doctor_state(
         "uv": shutil.which("uv") is not None,
     }
 
+    # C2: which sandbox backend compute would use right now, and whether the workspace mixes clients
+    sandbox_info: dict[str, Any] = {"backend": "sin workspace", "clientes_reales": 0, "computo_permitido": True}
+    if paths is not None:
+        probe_guard = ExecutionGuard(
+            paths,
+            AgentExecutionContext(
+                engagement_id="_doctor", client_id="_doctor", node_id="_doctor", profile="analitico", base_env=effective_env
+            ),
+        )
+        n_clients = len(count_real_clients_in_workspace(paths))
+        try:
+            backend, _ = probe_guard._resolve_sandbox_backend()
+        except (PermissionError, ValueError) as exc:
+            backend = f"error: {exc}"
+        shared_ok = effective_env.get("M37_ALLOW_SHARED_WORKSPACE_COMPUTE", "").strip() == "1"
+        sandbox_info = {
+            "backend": backend,
+            "clientes_reales": n_clients,
+            "computo_permitido": backend == "container" or n_clients <= 1 or shared_ok,
+        }
+
     return {
         "version": __version__,
+        "sandbox": sandbox_info,
         "python": sys.version.split()[0],
         "workspace_root": str(paths.workspace_root) if paths else None,
         "vault_initialized": bool(paths and (paths.vault_root / "00_Sistema").is_dir()),
@@ -391,6 +442,8 @@ def create_new_engagement(
     dominios: list[str] | None = None,
 ) -> Path:
     """Create a structured engagement folder and a valid 00_Brief.md."""
+    engagement_id = _validate_entity_id(engagement_id, "ID de encargo")
+    client_id = _validate_entity_id(client_id, "Código de cliente")
     enc_dir = paths.engagement_dir(engagement_id)
     if enc_dir.exists():
         raise FileExistsError(f"El encargo {engagement_id!r} ya existe en {enc_dir}.")
@@ -548,6 +601,7 @@ def generate_plan_from_archetype(
     approve_gate_1: bool = False,
     approve_gate_2: bool = False,
     harness_mode: bool = False,
+    approver: str = "socio_humano",
     env: Mapping[str, str] | None = None,
     completion_fn: Callable[..., Any] | None = None,
 ) -> tuple[Path, list[Path]]:
@@ -574,29 +628,22 @@ def generate_plan_from_archetype(
     )
     assert isinstance(brief_obj, BriefContract)
 
-    live_brief_sha = compute_brief_substantive_sha256(brief_meta, brief_body)
     if approve_gate_1:
-        brief_meta["puerta_1_aprobada"] = True
-        brief_meta["puerta_1_sha256"] = live_brief_sha
-        write_utf8_lf(brief_path, dump_markdown_note(brief_meta, brief_body))
-        brief_obj.puerta_1_aprobada = True
-        brief_obj.puerta_1_sha256 = live_brief_sha
+        approve_gate(paths, engagement_id, 1, approver=approver)
+        brief_obj, brief_meta, brief_body = validate_artifact_content(
+            brief_path.read_text(encoding="utf-8"),
+            suffix=".md",
+            expected_tipo="brief",
+        )
+        assert isinstance(brief_obj, BriefContract)
 
-    if not brief_obj.puerta_1_aprobada:
-        raise PermissionError(
-            f"Puerta 1 pendiente en {brief_path.name}: revisa el Brief y aprueba puerta_1_aprobada=true (o pasa --approve-gate-1)."
-        )
-    if brief_obj.puerta_1_sha256 and brief_obj.puerta_1_sha256 != live_brief_sha:
-        raise PermissionError(
-            f"Puerta 1 invalidada en {brief_path.name}: el contenido sustantivo del Brief cambió después de aprobarse."
-        )
+    gate_1_ok, gate_1_reason = evaluate_gate_1(brief_meta, brief_body)
+    if not gate_1_ok:
+        raise gates.HumanGateError(gate_1_reason)
 
     catalog = load_model_catalog(paths.modelos_yaml_path())
     active = filter_active_models(catalog, effective_env)
-    if not active and harness_mode:
-        # Host-harness subscription mode (Antigravity, Claude Code, Codex CLI): use catalog profiles without external API keys
-        active = dict(catalog.modelos)
-    if not active:
+    if not active and not harness_mode:
         raise RoutingGuardrailError(
             "Ningún modelo activo en Modelos.yaml. Configura al menos una API key en .env o usa --harness para operar con tu plan actual."
         )
@@ -612,18 +659,38 @@ def generate_plan_from_archetype(
     total_budget = 0.0
 
     for spec_node in arq_contract.nodos:
-        routing = recommend_routing_for_axis(
-            active,
-            spec_node.eje_dominante,
-            rigor=rigor,
-            dominio=dom,
-            metodo=spec_node.metodo,
-            episodios_path=episodios_file,
-            contexto_estimado_tokens=spec_node.contexto_estimado_tokens,
-            presupuesto_max_usd=spec_node.presupuesto_max_usd,
-            max_turns=spec_node.max_turns,
-            require_qa=(need_qa and spec_node.perfil_herramientas != "editorial"),
-        )
+        if harness_mode:
+            # NA4: the host harness runs the node; the kernel neither routes nor can know which model answered.
+            # Recording a catalog model here would be an invented provenance.
+            routing = ModelRoutingSpec(
+                eje_dominante=spec_node.eje_dominante,
+                contexto_estimado_tokens=spec_node.contexto_estimado_tokens,
+                modelo_ejecutor=HARNESS_EXECUTOR_ALIAS,
+                justificacion_ejecutor=(
+                    "Nodo ejecutado por el agente del harness anfitrión vía MCP; el kernel no enruta ni verifica el modelo."
+                ),
+                modelo_qa_critico=None,
+                justificacion_qa=(
+                    "QA atestiguable solo con `m37 qa` (kernel, otra familia) o `m37 bless` (humano)."
+                    if need_qa and spec_node.perfil_herramientas != "editorial"
+                    else None
+                ),
+                presupuesto_max_usd=spec_node.presupuesto_max_usd,
+                max_turns=spec_node.max_turns,
+            )
+        else:
+            routing = recommend_routing_for_axis(
+                active,
+                spec_node.eje_dominante,
+                rigor=rigor,
+                dominio=dom,
+                metodo=spec_node.metodo,
+                episodios_path=episodios_file,
+                contexto_estimado_tokens=spec_node.contexto_estimado_tokens,
+                presupuesto_max_usd=spec_node.presupuesto_max_usd,
+                max_turns=spec_node.max_turns,
+                require_qa=(need_qa and spec_node.perfil_herramientas != "editorial"),
+            )
         node_meta = {
             "id": spec_node.id,
             "tipo": "nodo",
@@ -652,7 +719,8 @@ def generate_plan_from_archetype(
         )
         node_obj, _, _ = validate_artifact_content(node_text, suffix=".md", expected_tipo="nodo")
         assert isinstance(node_obj, NodeContract)
-        validate_node_routing(node_obj, catalog, active, rigor)
+        if not harness_mode:
+            validate_node_routing(node_obj, catalog, active, rigor)
 
         npath = enc_dir / "Nodos" / f"{spec_node.id}.md"
         write_utf8_lf(npath, node_text)
@@ -668,8 +736,9 @@ def generate_plan_from_archetype(
         "encargo": engagement_id,
         "arquetipo_base": arq_contract.id_arquetipo,
         "nodos": node_ids,
-        "presupuesto_total_estimado_usd": round(total_budget, 2),
-        "puerta_2_aprobada": bool(approve_gate_2 and not use_llm_orchestrator),
+        "presupuesto_total_estimado_usd": 0.0 if harness_mode else round(total_budget, 2),
+        "modo_ejecucion": "harness" if harness_mode else "api",
+        "puerta_2_aprobada": False,
     }
     episodic_l2 = summarize_episodic_level2(episodios_file)
     plan_body = (
@@ -677,12 +746,12 @@ def generate_plan_from_archetype(
         + "\n".join(f"- `[[{nid}]]`" for nid in node_ids)
         + f"\n\n## Telemetría Episódica Nivel 2 Consultada\n\nRegistros históricos agregados: {len(episodic_l2)}.\n"
     )
-    if plan_meta["puerta_2_aprobada"]:
-        plan_meta["puerta_2_sha256"] = compute_plan_dag_sha256(plan_meta, plan_body, node_paths)
     plan_text = dump_markdown_note(plan_meta, plan_body)
     validate_artifact_content(plan_text, suffix=".md", expected_tipo="plan")
     plan_path = enc_dir / "01_Plan.md"
     write_utf8_lf(plan_path, plan_text)
+    if approve_gate_2 and not use_llm_orchestrator:
+        approve_gate(paths, engagement_id, 2, approver=approver)
 
     # Optional LLM-assisted orchestration when --orchestrator <alias> is explicitly provided
     if use_llm_orchestrator:
@@ -809,8 +878,8 @@ def _build_contract_reference_cheatsheet(node_obj: NodeContract | str | None = N
             "- `vigencia_dias_max`: entero > 0 (ej. `365`)\n"
             "- `url`: string o `null`\n"
             "- `localizador_verificable`: string >= 3 caracteres (ej. `\"Tabla 4.2, pág. 38\"`)\n"
-            "- `snapshot_local`: ruta en `referencias/...` devuelta por `web_fetch_clean` o archivo local\n"
-            "- `hash_snapshot`: estampado automáticamente por el kernel al verificar `snapshot_local`\n"
+            "- `snapshot_local`: ruta en `referencias/...` devuelta por `web_fetch_clean` o registrada por una persona con `m37 ingest` (un archivo que escribas tú no cuenta como fuente)\n"
+            "- `hash_snapshot` y `origen_snapshot`: estampados por el kernel desde el registro de snapshots\n"
             "- `fiabilidad`: `alta` | `media` | `baja`\n"
             "- `cita_verificada`: booleano (el kernel verifica el extracto textual contra `snapshot_local`)\n"
             "- `invalidada`: `false`\n"
@@ -916,6 +985,7 @@ def run_engagement(
     *,
     target_node_id: str | None = None,
     approve_gate_2: bool = False,
+    approver: str = "socio_humano",
     env: Mapping[str, str] | None = None,
     completion_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
@@ -930,13 +1000,9 @@ def run_engagement(
         expected_tipo="brief",
     )
     assert isinstance(brief_obj, BriefContract)
-    if not brief_obj.puerta_1_aprobada:
-        raise PermissionError("Puerta 1 no aprobada en 00_Brief.md.")
-    live_brief_sha = compute_brief_substantive_sha256(brief_meta, brief_body)
-    if brief_obj.puerta_1_sha256 and brief_obj.puerta_1_sha256 != live_brief_sha:
-        raise PermissionError(
-            "Puerta 1 invalidada: el contenido sustantivo de 00_Brief.md fue modificado después de su aprobación."
-        )
+    gate_1_ok, gate_1_reason = evaluate_gate_1(brief_meta, brief_body)
+    if not gate_1_ok:
+        raise gates.HumanGateError(gate_1_reason)
 
     # SPEC-01 §5: Enforce L3/L4 Privacy Gate BEFORE sending a single token
     check_privacy_gate(brief_obj.nivel_rigor, effective_env)
@@ -955,19 +1021,16 @@ def run_engagement(
         if not np.is_file():
             raise FileNotFoundError(f"El nodo declarado en 01_Plan.md no existe en disco: {np.name}")
 
-    live_plan_sha = compute_plan_dag_sha256(plan_meta, plan_body, all_plan_node_paths)
-    if approve_gate_2:
-        plan_meta["puerta_2_aprobada"] = True
-        plan_meta["puerta_2_sha256"] = live_plan_sha
-        write_utf8_lf(plan_path, dump_markdown_note(plan_meta, plan_body))
-        plan_obj.puerta_2_aprobada = True
-        plan_obj.puerta_2_sha256 = live_plan_sha
-    if not plan_obj.puerta_2_aprobada:
-        raise PermissionError("Puerta 2 no aprobada en 01_Plan.md (usa puerta_2_aprobada=true o --approve-gate-2).")
-    if plan_obj.puerta_2_sha256 and plan_obj.puerta_2_sha256 != live_plan_sha:
+    if plan_obj.modo_ejecucion == "harness":
         raise PermissionError(
-            "Puerta 2 invalidada: 01_Plan.md o la configuración de Nodos/ fue modificada después de aprobar Puerta 2."
+            "Este plan se generó en modo harness (los nodos los ejecuta el agente anfitrión vía MCP). "
+            "`m37 run` solo ejecuta planes en modo API: vuelve a planificar sin --harness."
         )
+    if approve_gate_2:
+        approve_gate(paths, engagement_id, 2, approver=approver)
+    gate_2_ok, gate_2_reason = evaluate_gate_2(enc_dir)
+    if not gate_2_ok:
+        raise gates.HumanGateError(gate_2_reason)
 
     catalog = load_model_catalog(paths.modelos_yaml_path())
     active = filter_active_models(catalog, effective_env)
@@ -1029,6 +1092,8 @@ def run_engagement(
             allow_compute=node_obj.requiere_computo,
             env_secrets=env_secrets,
             base_env=effective_env,
+            web_allowed_domains=tuple(brief_obj.dominios_web_permitidos),
+            web_requires_allowlist=brief_obj.nivel_rigor in ("L3", "L4"),
         )
 
         node_budget_limit = node_obj.enrutamiento_modelo.presupuesto_max_usd
@@ -1328,17 +1393,8 @@ def run_engagement(
         node_meta["estado"] = final_node_state
         write_utf8_lf(npath, dump_markdown_note(node_meta, node_body))
 
-        # Refresh puerta_2_sha256 after kernel-updated node state so subsequent single-node runs remain valid
-        if plan_obj.puerta_2_aprobada and plan_obj.puerta_2_sha256:
-            _, latest_p_meta, latest_p_body = validate_artifact_content(
-                plan_path.read_text(encoding="utf-8"),
-                suffix=".md",
-                expected_tipo="plan",
-            )
-            latest_p_meta["puerta_2_sha256"] = compute_plan_dag_sha256(
-                latest_p_meta, latest_p_body, all_plan_node_paths
-            )
-            write_utf8_lf(plan_path, dump_markdown_note(latest_p_meta, latest_p_body))
+        # A4: Puerta 2 is never re-sealed by the kernel. `estado` and `rondas_qa` are outside the hash, so node state
+        # updates keep it valid; any other change to the plan or nodes must go back to a human.
 
         rounded_cost = round(total_node_cost, 6)
         append_episodic_event(
@@ -1386,6 +1442,285 @@ def _set_finding_qa_state(finding_path: Path, new_state: str) -> None:
     meta, body = parse_raw_artifact(finding_path.read_text(encoding="utf-8"), suffix=".md")
     meta["estado_qa"] = new_state
     write_utf8_lf(finding_path, dump_markdown_note(meta, body))
+
+
+# ======================================================================
+# Kernel-run Blind QA (NC3) and human snapshot ingestion (NC2)
+# ======================================================================
+def select_cross_family_qa_model(
+    active: Mapping[str, ModelCatalogEntry],
+    author_family: str,
+) -> tuple[str, ModelCatalogEntry]:
+    """Pick the strongest adversarial critic whose provider family differs from the author's. No same-family fallback."""
+    fam = author_family.strip().lower()
+    candidates = [(a, e) for a, e in active.items() if e.familia.strip().lower() != fam]
+    if not candidates:
+        raise RoutingGuardrailError(
+            f"No hay ningún modelo activo de una familia distinta a {author_family!r} para auditar. "
+            "Configura en .env la API key de otro proveedor de Modelos.yaml o usa `m37 bless` con revisión humana."
+        )
+    return sorted(
+        candidates,
+        key=lambda kv: (kv[1].capacidades.critica_adversarial, -kv[1].costo_usd_1m_out),
+        reverse=True,
+    )[0]
+
+
+def _kernel_attested_verdicts(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    finding_id: str,
+) -> list[tuple[Path, QAVerdictContract]]:
+    qa_dir = paths.engagement_dir(engagement_id) / "QA"
+    found: list[tuple[tuple[int, str], Path, QAVerdictContract]] = []
+    if not qa_dir.is_dir():
+        return []
+    for vfile in qa_dir.glob("V-*.md"):
+        if vfile.name.startswith("V-BLESS-"):
+            continue
+        try:
+            v_obj, _, _ = validate_artifact_content(vfile.read_text(encoding="utf-8"), suffix=".md", expected_tipo="veredicto_qa")
+        except ContractValidationError:
+            continue
+        assert isinstance(v_obj, QAVerdictContract)
+        if extract_wikilink_id(v_obj.artefacto_auditado) != finding_id or not v_obj.revision_ciega_verificada:
+            continue
+        found.append(((vfile.stat().st_mtime_ns, vfile.name), vfile, v_obj))
+    found.sort(key=lambda item: item[0])
+    return [(pth, obj) for _, pth, obj in found]
+
+
+def run_kernel_blind_qa(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    finding_id: str,
+    *,
+    author_family: str | None = None,
+    budget_max_usd: float = 0.75,
+    env: Mapping[str, str] | None = None,
+    completion_fn: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Blind QA executed BY THE KERNEL through the API runner, on a model of a different family than the author.
+
+    This is the only automated path that yields `revision_ciega_verificada: true`: every read of the auditor goes
+    through ExecutionGuard's allowlist, and the auditor model is chosen and called by the kernel. It is how a
+    host-harness engagement (where the kernel cannot see who wrote or who reviewed) recovers an attestable QA.
+    """
+    effective_env = dict(env) if env is not None else load_effective_env()
+    enc_dir = paths.engagement_dir(engagement_id)
+    brief_obj = gates.assert_gate_1(enc_dir)
+    gates.assert_gate_2(enc_dir)
+    check_privacy_gate(brief_obj.nivel_rigor, effective_env)
+
+    family = (
+        author_family
+        or effective_env.get("M37_AUTHOR_FAMILY")
+        or effective_env.get("M37_HARNESS_FAMILY")
+        or ""
+    ).strip().lower()
+    if not family:
+        raise RoutingGuardrailError(
+            "Declara la familia del modelo que redactó el hallazgo (--familia-autor o M37_HARNESS_FAMILY; "
+            "p. ej. anthropic, google, openai). Sin ese dato el kernel no puede garantizar un auditor de otra familia."
+        )
+
+    catalog = load_model_catalog(paths.modelos_yaml_path())
+    active = filter_active_models(catalog, effective_env)
+    qa_alias, qa_entry = select_cross_family_qa_model(active, family)
+
+    bare_hid = extract_wikilink_id(finding_id)
+    hpath = resolve_artifact_by_id(paths, engagement_id, bare_hid)
+    if hpath.parent.resolve() != (enc_dir / "Hallazgos").resolve():
+        raise ValueError(f"{bare_hid!r} no es un Hallazgo de {engagement_id!r}.")
+
+    live_sha = compute_finding_substantive_sha256(hpath)
+    prior = _kernel_attested_verdicts(paths, engagement_id, bare_hid)
+    ronda = 1
+    r1_path: Path | None = None
+    r1_obj: QAVerdictContract | None = None
+    if prior:
+        last_path, last = prior[-1]
+        accepted = last.decision in ("aceptar", "aceptar_con_correcciones")
+        if accepted and last.sha256_artefacto_auditado == live_sha:
+            raise ValueError(
+                f"{bare_hid} ya tiene un veredicto atestiguado vigente ({last.id}: {last.decision}); no se re-audita "
+                "un contenido idéntico para buscar otro resultado."
+            )
+        if not accepted:
+            if last.ronda >= 2:
+                raise PermissionError(
+                    f"{bare_hid} agotó las 2 rondas de QA ({last.id}). Requiere decisión humana: `m37 bless` o retirar el hallazgo."
+                )
+            if last.sha256_artefacto_auditado == live_sha:
+                raise ValueError(
+                    f"{bare_hid} no cambió desde el rechazo de Ronda 1 ({last.id}); remedia el hallazgo antes de la Ronda 2."
+                )
+            ronda, r1_path, r1_obj = 2, last_path, last
+
+    r1_snapshot_text: str | None = None
+    if r1_obj is not None:
+        snap_file = enc_dir / "QA" / ".r1" / f"{r1_obj.id}.snapshot"
+        if snap_file.is_file():
+            r1_snapshot_text = snap_file.read_text(encoding="utf-8")
+
+    phase_a = verify_finding_phase_a(
+        paths,
+        engagement_id,
+        hpath,
+        rigor=brief_obj.nivel_rigor,
+        r1_finding_snapshot=r1_snapshot_text,
+        r1_verdict=r1_obj if r1_snapshot_text is not None else None,
+    )
+    if not phase_a.passed:
+        _set_finding_qa_state(hpath, "rechazado")
+        return {
+            "ok": False,
+            "id_hallazgo": bare_hid,
+            "ronda": ronda,
+            "fase_a_aprobada": False,
+            "errores": phase_a.errors,
+        }
+
+    v_id = allocate_next_id(paths, "V", engagement_id=engagement_id)
+    v_rel = f"vault/20_Encargos/{engagement_id}/QA/{v_id}.md"
+    v_abs = paths.workspace_root / v_rel
+    allowlist = build_blind_qa_allowlist(paths, engagement_id, hpath, ronda=ronda, prior_verdict_path=r1_path)
+    qa_sys = _load_agent_instructions(paths, "qa-critico")
+    cheatsheet = _build_qa_verdict_cheatsheet(
+        paths,
+        audited_id=bare_hid,
+        verdict_id=v_id,
+        verdict_rel_path=v_rel,
+        ronda=ronda,
+        allowlist=allowlist,
+    )
+    contrast = f" contrastando con `{r1_path.name}`" if r1_path is not None else ""
+    qa_user = (
+        f"Audita en Ronda {ronda} el artefacto `{hpath.name}` del encargo `{engagement_id}`{contrast} y "
+        f"escribe el veredicto en `{v_rel}` con id `{v_id}`.\n\n{cheatsheet}"
+    )
+    qa_ctx = AgentExecutionContext(
+        engagement_id=engagement_id,
+        client_id=brief_obj.cliente,
+        node_id=f"QA-KERNEL-{bare_hid}-R{ronda}",
+        profile="qa_ciego",
+        model_alias=qa_alias,
+        model_family=qa_entry.familia,
+        allow_surgical_edit=False,
+        allow_compute=False,
+        blind_qa_allowlist=allowlist,
+        assigned_qa_target=bare_hid,
+        env_secrets=extract_secret_values(effective_env),
+        base_env=effective_env,
+        blindness_enforced=True,
+    )
+    audited_snapshot = hpath.read_text(encoding="utf-8")
+    outcome = execute_stateless_node_loop(
+        paths,
+        qa_ctx,
+        qa_entry,
+        qa_sys,
+        qa_user,
+        max_turns=8,
+        budget_max_usd=budget_max_usd,
+        completion_fn=completion_fn,
+    )
+
+    decision: str | None = None
+    estado_qa = "pendiente"
+    if v_abs.is_file():
+        v_obj, _, _ = validate_artifact_content(v_abs.read_text(encoding="utf-8"), suffix=".md", expected_tipo="veredicto_qa")
+        assert isinstance(v_obj, QAVerdictContract)
+        if extract_wikilink_id(v_obj.artefacto_auditado) == bare_hid:
+            decision = v_obj.decision
+            # Keep what the auditor actually saw, so a later Ronda 2 can be checked against it.
+            write_utf8_lf(enc_dir / "QA" / ".r1" / f"{v_id}.snapshot", audited_snapshot)
+            if decision == "aceptar":
+                estado_qa = "aprobado" if ronda == 1 else "aprobado_con_correcciones"
+            elif decision == "aceptar_con_correcciones":
+                estado_qa = "aprobado_con_correcciones"
+            else:
+                estado_qa = "rechazado"
+            _set_finding_qa_state(hpath, estado_qa)
+
+    append_episodic_event(
+        paths.episodios_path(),
+        {
+            "evento": "qa_kernel_ejecutado",
+            "encargo": engagement_id,
+            "hallazgo": bare_hid,
+            "ronda": ronda,
+            "familia_autor": family,
+            "modelo_qa": qa_alias,
+            "familia_qa": qa_entry.familia,
+            "veredicto": v_id if decision else None,
+            "decision": decision,
+            "estado_salida": outcome.status,
+            "turnos": outcome.turns_used,
+            "tokens_in": outcome.prompt_tokens,
+            "tokens_out": outcome.completion_tokens,
+            "costo_usd": outcome.cost_usd,
+        },
+    )
+    return {
+        "ok": decision is not None,
+        "id_hallazgo": bare_hid,
+        "ronda": ronda,
+        "fase_a_aprobada": True,
+        "veredicto": v_id if decision else None,
+        "decision": decision,
+        "estado_qa_hallazgo": estado_qa,
+        "modelo_qa": qa_alias,
+        "familia_qa": qa_entry.familia,
+        "familia_autor": family,
+        "runner_status": outcome.status,
+        "costo_usd": outcome.cost_usd,
+        "motivo": None if decision else f"El auditor no emitió un veredicto válido ({outcome.status}: {outcome.final_message[:200]}).",
+    }
+
+
+def ingest_reference(
+    paths: WorkspacePaths,
+    engagement_id: str,
+    source_file: Path | str,
+    *,
+    public: bool = False,
+    author: str = "socio_humano",
+) -> dict[str, Any]:
+    """Human-only entry of a source document into referencias/ with a registered provenance (`ingesta_humana`).
+
+    Together with `web_fetch_clean` (kernel fetch) this is the only way a snapshot becomes citable.
+    """
+    engagement_id = _validate_entity_id(engagement_id, "ID de encargo")
+    if not paths.engagement_dir(engagement_id).is_dir():
+        raise FileNotFoundError(f"El encargo {engagement_id!r} no existe.")
+    src = Path(source_file).expanduser().resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"No existe el archivo a ingerir: {source_file}")
+    if src.stat().st_size > 20 * 1024 * 1024:
+        raise ValueError("El archivo excede 20 MB; ingiere un extracto en texto.")
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", src.name).lstrip(".") or "fuente.txt"
+    dest_dir = paths.referencias_root / (PUBLIC_SNAPSHOT_DIRNAME if public else engagement_id)
+    dest = dest_dir / safe_name
+    if dest.exists():
+        raise FileExistsError(
+            f"Ya existe {dest.relative_to(paths.workspace_root).as_posix()}; los snapshots no se sobrescriben. Renombra el archivo."
+        )
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dest)
+    record = register_snapshot(paths, dest, "ingesta_humana", author=author.strip() or "socio_humano")
+    append_episodic_event(
+        paths.episodios_path(),
+        {
+            "evento": "snapshot_ingerido",
+            "encargo": engagement_id,
+            "snapshot": record["path"],
+            "sha256": record["sha256"],
+            "autor": record["autor"],
+            "publico": public,
+        },
+    )
+    return record
 
 
 def bless_finding(
@@ -1470,12 +1805,13 @@ def verify_engagement(
 ) -> dict[str, Any]:
     """Audit all Derivations and Findings in an engagement (and optionally re-execute all producer scripts via --rerun)."""
     enc_dir = paths.engagement_dir(engagement_id)
-    brief_obj, _, _ = validate_artifact_content(
+    brief_obj, brief_meta, brief_body = validate_artifact_content(
         (enc_dir / "00_Brief.md").read_text(encoding="utf-8"),
         suffix=".md",
         expected_tipo="brief",
     )
     assert isinstance(brief_obj, BriefContract)
+    gate_1_ok, gate_1_reason = evaluate_gate_1(brief_meta, brief_body)
 
     cascade_summary = refresh_engagement_hashes_and_quarantine(paths, engagement_id)
 
@@ -1508,7 +1844,7 @@ def verify_engagement(
             )
             if brief_obj.nivel_rigor in ("L3", "L4"):
                 saw_verdict, verdict_matches = has_valid_content_bound_qa_verdict(
-                    paths, engagement_id, hfile.stem, hfile
+                    paths, engagement_id, hfile.stem, hfile, require_attested=True
                 )
                 has_verdict = saw_verdict and verdict_matches
             else:
@@ -1517,7 +1853,9 @@ def verify_engagement(
             errors = list(res.errors)
             if not has_verdict:
                 errors.append(
-                    f"Hallazgo {hfile.name} carece de Veredicto QA enlazado al hash sustantivo actual en QA/V-*.md."
+                    f"Hallazgo {hfile.name} carece de un Veredicto QA válido para {brief_obj.nivel_rigor}: debe aceptar, "
+                    "estar ligado al hash sustantivo actual y ser QA ciego atestiguado por el kernel (`m37 qa`) o un "
+                    "acta humana (`m37 bless`)."
                 )
             finding_results[hfile.name] = {"passed": passed, "errors": errors, "warnings": res.warnings}
             if not passed:
@@ -1527,7 +1865,8 @@ def verify_engagement(
         "encargo": engagement_id,
         "rigor": brief_obj.nivel_rigor,
         "rerun_ejecutado": rerun,
-        "passed": all_passed,
+        "puerta_1": {"vigente": gate_1_ok, "detalle": gate_1_reason},
+        "passed": all_passed and gate_1_ok,
         "cascada": cascade_summary,
         "derivaciones": deriv_results,
         "hallazgos": finding_results,
@@ -1658,6 +1997,17 @@ def cli_doctor(
         if info["cross_family_qa_ready"]
         else f"[yellow]Modo mono-proveedor o sin llaves ({', '.join(info['active_families']) or '0 familias'})[/yellow]",
     )
+    sbx = info["sandbox"]
+    if sbx["backend"] == "container":
+        sbx_label = "[green]container (sin red; solo el encargo montado)[/green]"
+    elif sbx["computo_permitido"]:
+        sbx_label = f"process (alarma, no aísla clientes) · clientes reales en el workspace: {sbx['clientes_reales']}"
+    else:
+        sbx_label = (
+            f"[bold red]process con {sbx['clientes_reales']} clientes: cómputo BLOQUEADO[/bold red] "
+            "(usa el backend container o un workspace por cliente)"
+        )
+    table.add_row("Sandbox de cómputo", sbx_label)
     opts = ", ".join(f"{k}={'sí' if v else 'no'}" for k, v in info["optional_tools"].items())
     table.add_row("Extensiones Full opcionales", opts)
     console.print(table)
@@ -1670,7 +2020,11 @@ def cli_init(
     force: bool = typer.Option(False, "--force", help="Sobrescribir si el directorio ya existe."),
 ) -> None:
     """Inicializa un workspace M37 completo (vault/, analisis/, codigo/, datos/, render/, referencias/)."""
-    paths = init_workspace(destino, clean_l4=clean_l4, force=force)
+    try:
+        paths = init_workspace(destino, clean_l4=clean_l4, force=force)
+    except GitLeakSafetyError as exc:
+        console.print(f"[bold red]INIT BLOQUEADO:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
     mode_label = "L4 Limpio (sin artefactos DEMO)" if clean_l4 else "Estándar (con DEMO-01_entrada-mercado listo para compilar)"
     console.print(
         Panel(
@@ -1697,8 +2051,13 @@ def cli_new(
 ) -> None:
     """Crea la estructura aislada de un nuevo encargo y su contrato 00_Brief.md."""
     paths = resolve_workspace_paths(vault)
-    brief_path = create_new_engagement(paths, id_encargo, cliente, rigor=rigor, pregunta=pregunta)  # type: ignore[arg-type]
+    try:
+        brief_path = create_new_engagement(paths, id_encargo, cliente, rigor=rigor, pregunta=pregunta)  # type: ignore[arg-type]
+    except (ValueError, FileExistsError) as exc:
+        console.print(f"[bold red]ENCARGO NO CREADO:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
     console.print(f"[green]Encargo creado:[/green] {brief_path}")
+    console.print(f"Siguiente paso humano: revisa el Brief y ejecuta [bold]m37 approve {id_encargo} --gate 1[/bold].")
 
 
 @app.command("plan")
@@ -1722,6 +2081,8 @@ def cli_plan(
 ) -> None:
     """Genera 01_Plan.md y Nodos/N-*.md desde el plugin declarativo Arquetipos/*.md y el router SPEC-02."""
     paths = resolve_workspace_paths(vault)
+    if approve_gate_1 or approve_gate_2:
+        gates.require_interactive_human("Aprobar una puerta (--approve-gate-N)")
     try:
         plan_path, nodes = generate_plan_from_archetype(
             paths,
@@ -1732,10 +2093,13 @@ def cli_plan(
             orchestrator=orchestrator,
             harness_mode=harness,
         )
-    except RoutingGuardrailError as exc:
+    except (RoutingGuardrailError, PermissionError) as exc:
         console.print(f"[bold red]PLANIFICACIÓN BLOQUEADA:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
     console.print(f"[green]Plan generado:[/green] {plan_path} ({len(nodes)} nodos validados).")
+    gate_2_ok, _ = evaluate_gate_2(paths.engagement_dir(id_encargo))
+    if not gate_2_ok:
+        console.print(f"Siguiente paso humano: revisa el plan y ejecuta [bold]m37 approve {id_encargo} --gate 2[/bold].")
 
 
 @app.command("run")
@@ -1747,6 +2111,8 @@ def cli_run(
 ) -> None:
     """Ejecuta los nodos pendientes del DAG con verificación mecánica Fase A y QA Ciego Cruzado."""
     paths = resolve_workspace_paths(vault)
+    if approve_gate_2:
+        gates.require_interactive_human("Aprobar una puerta (--approve-gate-2)")
     try:
         res = run_engagement(paths, id_encargo, target_node_id=nodo, approve_gate_2=approve_gate_2)
     except (PrivacyGateError, RoutingGuardrailError, PermissionError) as exc:
@@ -1826,9 +2192,112 @@ def cli_bless(
     vault: Path | None = typer.Option(None, "--vault"),
 ) -> None:
     """Registra aprobación humana auditable (QA/V-BLESS-*.md) para destrabar un Hallazgo escalado."""
+    gates.require_interactive_human("m37 bless")
     paths = resolve_workspace_paths(vault)
     vpath = bless_finding(paths, encargo, id_hallazgo, justificacion, author=autor)
     console.print(f"[green]Hallazgo aprobado con acta humana:[/green] {vpath}")
+
+
+@app.command("approve")
+def cli_approve(
+    id_encargo: str = typer.Argument(..., help="ID del encargo."),
+    gate: int = typer.Option(..., "--gate", "-g", help="Puerta a sellar: 1 (Brief) o 2 (Plan y Nodos)."),
+    autor: str = typer.Option("socio_humano", "--autor", help="Quién aprueba (queda en el artefacto)."),
+    vault: Path | None = typer.Option(None, "--vault"),
+) -> None:
+    """Sella una puerta humana con el hash del contenido actual. Exige terminal interactiva: ningún agente puede usarla."""
+    gates.require_interactive_human("m37 approve")
+    paths = resolve_workspace_paths(vault)
+    enc_dir = paths.engagement_dir(id_encargo)
+    if gate == 1:
+        b_meta, _ = parse_raw_artifact((enc_dir / "00_Brief.md").read_text(encoding="utf-8"), suffix=".md")
+        resumen = (
+            f"Cliente: {b_meta.get('cliente')} · Rigor: {b_meta.get('nivel_rigor')}\n"
+            f"Pregunta: {b_meta.get('pregunta_central')}\n"
+            f"Decisión que habilita: {b_meta.get('decision_que_habilita')}\n"
+            f"Dominios web permitidos: {b_meta.get('dominios_web_permitidos') or 'ninguno'}"
+        )
+    elif gate == 2:
+        p_meta, _ = parse_raw_artifact((enc_dir / "01_Plan.md").read_text(encoding="utf-8"), suffix=".md")
+        lines = [
+            f"Arquetipo: {p_meta.get('arquetipo_base')} · Modo: {p_meta.get('modo_ejecucion', 'api')} · "
+            f"Presupuesto estimado: USD {p_meta.get('presupuesto_total_estimado_usd')}"
+        ]
+        for npath in gates.plan_node_paths(enc_dir, p_meta):
+            if npath.is_file():
+                nm, _ = parse_raw_artifact(npath.read_text(encoding="utf-8"), suffix=".md")
+                rt = nm.get("enrutamiento_modelo") or {}
+                lines.append(
+                    f"  {nm.get('id')}: {nm.get('perfil_herramientas')} · ejecutor={rt.get('modelo_ejecutor')} · "
+                    f"qa={rt.get('modelo_qa_critico')} · tope USD {rt.get('presupuesto_max_usd')} · depende_de={nm.get('depende_de')}"
+                )
+        resumen = "\n".join(lines)
+    else:
+        console.print("[red]Solo existen las Puertas 1 y 2.[/red]")
+        raise typer.Exit(code=1)
+    console.print(Panel(resumen, title=f"Puerta {gate} — {id_encargo}", border_style="yellow"))
+    if not typer.confirm(f"¿Apruebas la Puerta {gate} de {id_encargo} tal como está en disco?"):
+        console.print("Puerta no aprobada.")
+        raise typer.Exit(code=1)
+    try:
+        res = approve_gate(paths, id_encargo, gate, approver=autor)
+    except (PermissionError, ValueError, FileNotFoundError, ContractValidationError) as exc:
+        console.print(f"[bold red]APROBACIÓN RECHAZADA:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Puerta {gate} sellada[/green] por {res['aprobado_por']} · sha256 {res['sha256'][:16]}…")
+
+
+@app.command("qa")
+def cli_qa(
+    id_encargo: str = typer.Argument(..., help="ID del encargo."),
+    id_hallazgo: str = typer.Argument(..., help="ID del Hallazgo (H-*) a auditar."),
+    familia_autor: str | None = typer.Option(
+        None,
+        "--familia-autor",
+        help="Familia del modelo que redactó el hallazgo (anthropic, google, openai...). Por defecto M37_HARNESS_FAMILY.",
+    ),
+    presupuesto: float = typer.Option(0.75, "--presupuesto", help="Tope en USD para esta auditoría."),
+    vault: Path | None = typer.Option(None, "--vault"),
+) -> None:
+    """QA ciego ejecutado por el kernel vía API con un modelo de otra familia (único QA automático atestiguable)."""
+    paths = resolve_workspace_paths(vault)
+    try:
+        res = run_kernel_blind_qa(
+            paths,
+            id_encargo,
+            id_hallazgo,
+            author_family=familia_autor,
+            budget_max_usd=presupuesto,
+        )
+    except (PrivacyGateError, RoutingGuardrailError, PermissionError, ValueError, FileNotFoundError) as exc:
+        console.print(f"[bold red]QA BLOQUEADO:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=res)
+    if not res["ok"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("ingest")
+def cli_ingest(
+    archivo: Path = typer.Argument(..., help="Documento fuente a registrar como snapshot citable."),
+    encargo: str = typer.Option(..., "--encargo", "-e", help="Encargo al que pertenece la fuente."),
+    publico: bool = typer.Option(
+        False,
+        "--publico",
+        help="Fuente pública compartible entre encargos (referencias/_publico/). Por defecto queda aislada en el encargo.",
+    ),
+    autor: str = typer.Option("socio_humano", "--autor", help="Quién ingiere la fuente (queda en el registro)."),
+    vault: Path | None = typer.Option(None, "--vault"),
+) -> None:
+    """Registra un documento fuente en referencias/ con procedencia `ingesta_humana`. Exige terminal interactiva."""
+    gates.require_interactive_human("m37 ingest")
+    paths = resolve_workspace_paths(vault)
+    try:
+        rec = ingest_reference(paths, encargo, archivo, public=publico, author=autor)
+    except (FileNotFoundError, FileExistsError, ValueError, PermissionError) as exc:
+        console.print(f"[bold red]INGESTA RECHAZADA:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Snapshot registrado:[/green] {rec['path']} · sha256 {rec['sha256'][:16]}… · snapshot_local: {rec['path']}")
 
 
 @app.command("verify")
@@ -1930,13 +2399,17 @@ def cli_plugin_install(
         None,
         "--workspace",
         "-w",
-        help="Directorio del repositorio/workspace donde escribir manifiestos locales.",
+        help="Directorio del proyecto donde escribir manifiestos locales (por defecto, el directorio actual).",
     ),
 ) -> None:
     """Instala el plugin, skills, subagente m37-qa-ciego, reglas y servidor MCP m37-kernel en Antigravity, Claude Code y Codex CLI."""
-    from m37.harness import install_harness_plugin
+    from m37.harness import HarnessInstallError, install_harness_plugin
 
-    res = install_harness_plugin(target=target, scope=scope, workspace_dir=workspace)
+    try:
+        res = install_harness_plugin(target=target, scope=scope, workspace_dir=workspace)
+    except (HarnessInstallError, ValueError) as exc:
+        console.print(f"[bold red]INSTALACIÓN DETENIDA:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
     table = Table(title=f"M37 v{res['version']} — Instalación Multi-Harness ({res['target']} / {res['scope']})")
     table.add_column("Harness", style="cyan", no_wrap=True)
     table.add_column("Archivos Instalados", style="green")
@@ -1951,18 +2424,33 @@ def cli_plugin_status(
     workspace: Path | None = typer.Option(None, "--workspace", "-w"),
 ) -> None:
     """Verifica el estado de instalación del plugin M37 en Antigravity, Claude Code y OpenAI Codex CLI."""
-    from m37.harness import inspect_harness_status
+    from m37.harness import inspect_harness_status, probe_configured_mcp
 
-    status = inspect_harness_status(workspace_dir=workspace)
+    ws_dir = (workspace or Path.cwd()).expanduser().resolve()
+    status = inspect_harness_status(workspace_dir=ws_dir)
     table = Table(title="M37 — Estado del Plugin Multi-Harness")
     table.add_column("Harness", style="cyan", no_wrap=True)
     table.add_column("Global (~/)", style="white")
-    table.add_column("Workspace (Repo)", style="white")
+    table.add_column("Proyecto", style="white")
     for h_name, info in status.items():
-        g_str = "[green]Instalado[/green]" if info["global"] else "[yellow]No instalado[/yellow]"
-        w_str = "[green]Instalado[/green]" if info["workspace"] else "[yellow]No instalado[/yellow]"
+        g_str = "[green]Archivos presentes[/green]" if info["global"] else "[yellow]No instalado[/yellow]"
+        w_str = "[green]Archivos presentes[/green]" if info["workspace"] else "[yellow]No instalado[/yellow]"
         table.add_row(h_name, g_str, w_str)
     console.print(table)
+    probe = probe_configured_mcp(ws_dir / ".mcp.json")
+    if probe is None:
+        console.print(
+            "Servidor MCP del proyecto: no hay .mcp.json, o su entrada m37-kernel no es la que escribe este instalador "
+            "(no se ejecuta un comando desconocido)."
+        )
+    elif probe:
+        console.print("[green]Servidor MCP m37-kernel: arranca y responde `initialize` con el comando configurado.[/green]")
+    else:
+        console.print("[bold red]Servidor MCP m37-kernel: el comando configurado en .mcp.json NO arranca.[/bold red]")
+    console.print(
+        "Nota: 'Archivos presentes' no prueba que cada harness cargue el plugin; compruébalo listando sus "
+        "herramientas MCP dentro del propio harness."
+    )
 
 
 if __name__ == "__main__":

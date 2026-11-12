@@ -1,0 +1,12 @@
+# Stack disponible para scripts de analisis/<encargo>/ y para run_verification_cmd dentro del contenedor.
+# Fija versiones exactas (==) antes de usarlo con datos de clientes.
+polars
+duckdb
+pyarrow
+numpy
+pandas
+scipy
+statsmodels
+pytest
+ruff
+mypy
