@@ -1,4 +1,4 @@
-# M37 (Move 37) — Microkernel Agéntico Agnóstico para Consultoría de Alto Rigor
+# M37 (Move 37) — Microkernel Agéntico Agnóstico para la investigación
 
 > **Aviso (rama de remediación):** el flujo de puertas humanas, snapshots de fuentes, QA en L3/L4, sandbox e instalador de plugins cambió respecto a lo que describe este README. Los cambios están en [`CHANGELOG.md`](CHANGELOG.md); este documento se reescribe en la Fase 3.
 
