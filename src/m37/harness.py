@@ -436,13 +436,41 @@ def populate_workspace_harnesses(
     *,
     python_cmd: str,
     repo_root: Path | None = None,
+    target: str = "all",
 ) -> dict[str, list[str]]:
-    """Populate a repository/workspace with universal multi-harness files (Antigravity, Claude Code, OpenAI Codex CLI)."""
+    """Populate a project with the files of the requested harness(es) only (Antigravity, Claude Code, Codex CLI)."""
     ws = workspace_dir.resolve()
-    agy_written = install_antigravity_bundle(ws / "plugins" / "m37", python_cmd=python_cmd, repo_root=repo_root)
-    write_utf8_lf(ws / ".agents" / "skills" / "m37" / "SKILL.md", M37_SKILL_MARKDOWN)
-    agy_written.append(str(ws / ".agents" / "skills" / "m37" / "SKILL.md"))
+    norm_target = target.strip().lower()
+    if norm_target not in ("all", "antigravity", "claude", "codex"):
+        raise ValueError("Target inválido: use 'antigravity', 'claude', 'codex' o 'all'.")
+    agy_written: list[str] = []
+    claude_written: list[str] = []
+    codex_written: list[str] = []
 
+    if norm_target in ("all", "antigravity"):
+        agy_written = install_antigravity_bundle(ws / "plugins" / "m37", python_cmd=python_cmd, repo_root=repo_root)
+        write_utf8_lf(ws / ".agents" / "skills" / "m37" / "SKILL.md", M37_SKILL_MARKDOWN)
+        agy_written.append(str(ws / ".agents" / "skills" / "m37" / "SKILL.md"))
+
+    if norm_target in ("all", "claude"):
+        claude_written = _populate_claude_workspace(ws, python_cmd=python_cmd, repo_root=repo_root)
+
+    if norm_target in ("all", "codex"):
+        write_utf8_lf(
+            ws / ".codex" / "config.toml.example",
+            build_codex_toml_block(python_cmd=python_cmd, repo_root=repo_root),
+        )
+        _upsert_rules_block(ws / "AGENTS.md", M37_RULES_MARKDOWN)
+        codex_written = [str(ws / ".codex" / "config.toml.example"), str(ws / "AGENTS.md")]
+
+    return {
+        "antigravity": agy_written,
+        "claude": claude_written,
+        "codex": codex_written,
+    }
+
+
+def _populate_claude_workspace(ws: Path, *, python_cmd: str, repo_root: Path | None) -> list[str]:
     claude_files: dict[Path, str] = {
         ws / ".claude-plugin" / "plugin.json": json.dumps(build_claude_plugin_json(), ensure_ascii=False, indent=2)
         + "\n",
@@ -460,22 +488,7 @@ def populate_workspace_harnesses(
     _merge_mcp_json(ws / ".mcp.json", python_cmd=python_cmd, repo_root=repo_root)
     _upsert_rules_block(ws / "CLAUDE.md", M37_RULES_MARKDOWN)
     claude_written.extend([str(ws / ".mcp.json"), str(ws / "CLAUDE.md")])
-
-    codex_files: dict[Path, str] = {
-        ws / ".codex" / "config.toml.example": build_codex_toml_block(python_cmd=python_cmd, repo_root=repo_root),
-    }
-    codex_written: list[str] = []
-    for path, content in codex_files.items():
-        write_utf8_lf(path, content)
-        codex_written.append(str(path))
-    _upsert_rules_block(ws / "AGENTS.md", M37_RULES_MARKDOWN)
-    codex_written.append(str(ws / "AGENTS.md"))
-
-    return {
-        "antigravity": agy_written,
-        "claude": claude_written,
-        "codex": codex_written,
-    }
+    return claude_written
 
 
 def install_harness_plugin(
@@ -554,6 +567,7 @@ def install_harness_plugin(
             ws_root,
             python_cmd=ws_py_cmd,
             repo_root=repo_root,
+            target=norm_target,
         )
         for k in ("antigravity", "claude", "codex"):
             if norm_target in ("all", k):

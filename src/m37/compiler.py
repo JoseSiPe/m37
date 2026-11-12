@@ -675,6 +675,14 @@ def compile_deliverable(
     for idx, block in enumerate(blocks):
         fids = block_findings_map.get(idx, [])
         interpolated_derivs: list[str] = []
+        # Derivations are only ever audited through the Finding that cites them. A block may therefore interpolate
+        # {{D-XX.clave}} only from Derivations listed in `sustento_derivaciones` of a Finding it cites.
+        allowed_block_derivs = {
+            extract_wikilink_id(d)
+            for fid in fids
+            if fid in loaded_findings
+            for d in loaded_findings[fid][0].sustento_derivaciones
+        }
 
         # High #8: Verify that any quantitative metrics written directly in prose (outside {{...}} and ![[...]])
         # are anchored in the cited Findings, Derivations, Evidence, or Brief.
@@ -721,10 +729,25 @@ def compile_deliverable(
         expanded = TRANSCLUSION_RE.sub(_replace_transclusion, block)
 
         # 3b. Safe Python interpolation of {{D-XX.clave | fmt(...)}}
-        def _replace_interpolation(match: re.Match[str]) -> str:
+        def _replace_interpolation(
+            match: re.Match[str],
+            *,
+            allowed_block_derivs: set[str] = allowed_block_derivs,
+            fids: list[str] = fids,
+            idx: int = idx,
+        ) -> str:
             deriv_id = match.group(1).strip()
             key_path = match.group(2).strip()
             fmt_spec = match.group(3)
+
+            if extract_wikilink_id(deriv_id) not in allowed_block_derivs:
+                raise CompilerAbortError(
+                    f"PASADA 3 FALLIDA — Derivación interpolada sin respaldo auditado ({{{{{deriv_id}.{key_path}}}}} en "
+                    f"Bloque #{idx + 1}): toda derivación interpolada debe figurar en `sustento_derivaciones` de un "
+                    f"Hallazgo aprobado citado en ese mismo bloque (citados: {fids or 'ninguno'}).",
+                    pass_number=3,
+                    exit_code=4,
+                )
 
             try:
                 d_path = resolve_artifact_by_id(paths, engagement_id, deriv_id)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,15 @@ _queries = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_queries)
 
 
+def _same_workspace(a: Path | str, b: Path | str) -> bool:
+    return WorkspacePaths.from_root(str(a)).workspace_root == WorkspacePaths.from_root(str(b)).workspace_root
+
+
 def _get_db_path(vault_override: Path | str | None = None) -> Path:
+    # A server launched for one workspace (M37_VAULT) never serves another, whichever transport delivered the call.
+    pinned = (os.environ.get("M37_VAULT") or "").strip()
+    if pinned and vault_override and not _same_workspace(vault_override, pinned):
+        raise PermissionError("Este servidor está fijado a un workspace; el argumento `vault` no puede apuntar a otro.")
     paths: WorkspacePaths = resolve_workspace_paths(vault_override)
     db_path = paths.duckdb_index_path()
     if not db_path.is_file():
@@ -111,13 +120,30 @@ def handle_jsonrpc_request(req: dict[str, Any], *, vault: str | None = None) -> 
                 "serverInfo": {"name": "m37-episodic-graph", "version": "0.2.0"},
             },
         }
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": MCP_TOOL_CATALOG}}
     if method == "tools/call":
         params = req.get("params") or {}
         name = params.get("name")
         args = dict(params.get("arguments") or {})
-        if vault and "vault" not in args:
+        if vault:
+            requested = args.get("vault")
+            if requested and not _same_workspace(str(requested), vault):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Error: este servidor está fijado a un workspace; el argumento `vault` no puede apuntar a otro.",
+                            }
+                        ],
+                        "isError": True,
+                    },
+                }
             args["vault"] = vault
         fn = TOOL_DISPATCH.get(str(name))
         if fn is None:
@@ -152,15 +178,52 @@ def handle_jsonrpc_request(req: dict[str, Any], *, vault: str | None = None) -> 
     }
 
 
-def run_stdio_fallback() -> None:
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
+def _parse_request(raw: bytes) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return (request, error_response): malformed input becomes a JSON-RPC error instead of killing the server."""
+    try:
+        req = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {exc}"}}
+    if not isinstance(req, dict):
+        return None, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+    return req, None
+
+
+def run_stdio_fallback(vault: str | None = None) -> None:
+    """stdio loop: newline-delimited or Content-Length framed JSON-RPC 2.0, pinned to M37_VAULT when it is set."""
+    effective_vault = vault or (os.environ.get("M37_VAULT") or None)
+    stdin_buf = sys.stdin.buffer
+    stdout_buf = sys.stdout.buffer
+    while True:
+        first_line = stdin_buf.readline()
+        if not first_line:
+            break
+        stripped = first_line.strip()
+        if not stripped:
             continue
-        resp = handle_jsonrpc_request(json.loads(line))
-        if resp is not None:
-            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+        framed = stripped.lower().startswith(b"content-length:")
+        if framed:
+            try:
+                length = int(stripped.split(b":", 1)[1].strip())
+            except ValueError:
+                continue
+            while True:
+                hdr = stdin_buf.readline()
+                if not hdr or hdr in (b"\r\n", b"\n"):
+                    break
+            payload = stdin_buf.read(length)
+        else:
+            payload = stripped
+        req, err = _parse_request(payload)
+        resp = err if req is None else handle_jsonrpc_request(req, vault=effective_vault)
+        if resp is None:
+            continue
+        out_bytes = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+        if framed:
+            stdout_buf.write(f"Content-Length: {len(out_bytes)}\r\n\r\n".encode("ascii") + out_bytes)
+        else:
+            stdout_buf.write(out_bytes + b"\n")
+        stdout_buf.flush()
 
 
 try:

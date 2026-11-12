@@ -12,6 +12,7 @@ from m37.cli import (
     ClientLeakInCapitalError,
     _build_contract_reference_cheatsheet,
     _build_qa_verdict_cheatsheet,
+    bless_finding,
     close_engagement,
     generate_plan_from_archetype,
     init_workspace,
@@ -499,6 +500,8 @@ def test_med9_11_13_19_gate_hashes_atomic_capital_and_requiere_computo(tmp_path:
     h2_meta["id"] = "H-DEMO-01-02"
     h2_meta["afirmacion_corta"] = "El despliegue en ACME_latam requiere integración regional."
     write_utf8_lf(h2_path, dump_markdown_note(h2_meta, h1_body))
+    # Only findings with an attested verdict are candidates for promotion; a human signs this second one.
+    bless_finding(ws, enc_id, "H-DEMO-01-02", "Revisión humana del segundo hallazgo para la prueba de atomicidad.")
 
     cap_dir = ws.vault_root / "50_Capital"
     before_cap_files = list(cap_dir.glob("*.md"))

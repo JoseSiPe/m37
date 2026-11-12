@@ -362,8 +362,18 @@ def test_full_runner_state_machine_r1_reject_to_r2_accept_and_close_leak_guard(t
     # Sanitize client mention -> promotes cleanly to 50_Capital/!
     h_file = ws.engagement_dir("ENC-E2E-01") / "Hallazgos" / "H-ENC-E2E-01-01.md"
     write_utf8_lf(h_file, h_file.read_text(encoding="utf-8").replace("para ACME", "para operadores B2B"))
+    # The sanitizing edit happened AFTER QA: the finding is no longer the audited content, so it is not promoted.
+    stale = close_engagement(ws, "ENC-E2E-01")
+    assert stale["capital_promovido"] == []
+    assert [o["hallazgo"] for o in stale["capital_omitido"]] == ["H-ENC-E2E-01-01"]
+    # A human signs the sanitized text; only then does it reach the shared capital, under an anonymous ID.
+    bless_finding(ws, "ENC-E2E-01", "H-ENC-E2E-01-01", "Anonimización revisada por el socio antes del cierre.")
     closed = close_engagement(ws, "ENC-E2E-01", leccion="Calibrar fuerza epistémica desde Ronda 1.")
-    assert "C-H-ENC-E2E-01-01" in closed["capital_promovido"]
+    assert len(closed["capital_promovido"]) == 1
+    cap_id = closed["capital_promovido"][0]
+    assert re.fullmatch(r"C-\d{6}-\d{3}", cap_id) and closed["capital_origen"] == {cap_id: "H-ENC-E2E-01-01"}
+    cap_text = (ws.vault_root / "50_Capital" / f"{cap_id}.md").read_text(encoding="utf-8")
+    assert "ENC-E2E-01" not in cap_text and "ACME" not in cap_text
 
     # Bless governance check on a fresh pending finding
     h_meta, h_body = parse_raw_artifact(h_file.read_text(encoding="utf-8"), suffix=".md")
