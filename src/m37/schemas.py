@@ -197,6 +197,7 @@ class NodeContract(StrictContractModel):
     riesgo: Literal["bajo", "medio", "alto"] = "medio"
     estado: NodeState = "pendiente"
     rondas_qa: int = Field(ge=0, le=2, default=0)
+    timeout_segundos: int = Field(ge=5, le=600, default=60)
     enrutamiento_modelo: ModelRoutingSpec
 
     @field_validator("metodo")
@@ -224,6 +225,7 @@ class ArchetypeNodeSpec(StrictContractModel):
     contexto_estimado_tokens: int = Field(gt=0, default=24000)
     presupuesto_max_usd: float = Field(gt=0.0, le=50.0, default=0.75)
     max_turns: int = Field(ge=1, le=40, default=14)
+    timeout_segundos: int = Field(ge=5, le=600, default=60)
 
     @field_validator("metodo")
     @classmethod
@@ -292,6 +294,21 @@ class EvidenceContract(StrictContractModel):
     invalidada: bool = False
     motivo_invalidacion: str | None = None
 
+    @field_validator("url")
+    @classmethod
+    def _validar_url_evidencia(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        lower = cleaned.lower()
+        if not (lower.startswith("http://") or lower.startswith("https://")):
+            raise ValueError(
+                f"URL inválida en evidencia ({v!r}): solo se permiten esquemas http:// o https://."
+            )
+        return cleaned
+
     @model_validator(mode="after")
     def exigir_motivo_si_invalidada(self) -> EvidenceContract:
         if self.invalidada and not self.motivo_invalidacion:
@@ -299,13 +316,18 @@ class EvidenceContract(StrictContractModel):
         return self
 
 
-
-
 NUMERIC_LIKE_STRING_RE = re.compile(
     r"^\s*[-+~≈<>]?\s*(?:USD|MXN|EUR|US\$|\$|€)?\s*\d[\d.,]*\s*"
     r"(?:%|x|pp|pb|k|m|mm|b|bn|m[dn]p|musd|usd|mxn|eur|millones|mil|meses|años|dias|días)?\s*$",
     re.IGNORECASE,
 )
+EMBEDDED_QUANT_STRING_RE = re.compile(
+    r"(?:(?:USD|MXN|EUR|US\$|\$|€)\s*\d|\b\d+(?:[.,]\d+)*\s*(?:%|(?:pp|pb|musd|usd|mxn|eur|millones|mil|meses|años)\b))",
+    re.IGNORECASE,
+)
+SAFE_ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+SAFE_SCOPED_INPUT_PATH_RE = re.compile(r"^(?:datos|analisis|codigo)/[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+$")
+SAFE_SUSTENTO_ID_RE = re.compile(r"^(?:E|EI|D|H|C)-[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def _contains_numeric_value(val: Any) -> bool:
@@ -314,8 +336,8 @@ def _contains_numeric_value(val: Any) -> bool:
     if isinstance(val, (int, float)):
         return True
     if isinstance(val, str):
-        # A2: "37%", "1.60", "USD 12M" son cifras aunque vengan entre comillas.
-        return bool(NUMERIC_LIKE_STRING_RE.match(val))
+        # A2 / H4: "37%", "1.60", "USD 12M", "aprox. 37%" y "cuota: 37%" son cifras aunque vengan en texto.
+        return bool(NUMERIC_LIKE_STRING_RE.match(val) or EMBEDDED_QUANT_STRING_RE.search(val))
     if isinstance(val, dict):
         return any(_contains_numeric_value(v) for v in val.values())
     if isinstance(val, (list, tuple)):
@@ -327,6 +349,23 @@ def _contains_numeric_value(val: Any) -> bool:
 class InputHashRef(StrictContractModel):
     id_o_ruta: str
     sha256: str
+
+    @field_validator("id_o_ruta")
+    @classmethod
+    def _validar_id_o_ruta_insumo(cls, v: str) -> str:
+        raw = v.strip()
+        if not raw or "\\" in raw or raw.startswith("/") or ".." in raw.split("/"):
+            raise ValueError(f"Referencia de insumo insegura o fuera de perímetro: {v!r}")
+        if "/" in raw:
+            if raw.startswith("[[") or not SAFE_SCOPED_INPUT_PATH_RE.fullmatch(raw):
+                raise ValueError(
+                    f"Ruta de insumo fuera de los prefijos permitidos (datos/, analisis/, codigo/): {v!r}"
+                )
+            return v
+        cleaned = extract_wikilink_id(raw)
+        if not cleaned or not SAFE_ARTIFACT_ID_RE.fullmatch(cleaned):
+            raise ValueError(f"Identificador de insumo inválido: {v!r}")
+        return v
 
 
 class DerivationContract(StrictContractModel):
@@ -360,6 +399,17 @@ class DerivationContract(StrictContractModel):
                 "Prohibido usar productor_modo='estructuracion_analitica' con salidas numéricas cuantitativas; "
                 "toda cifra debe generarse con productor_modo='script' o 'verificacion_codigo' reproducible."
             )
+        allowed_prefixes = (
+            f"datos/{self.encargo}/",
+            f"analisis/{self.encargo}/",
+            f"codigo/{self.encargo}/",
+        )
+        for insumo in self.insumos:
+            raw_in = insumo.id_o_ruta.strip()
+            if "/" in raw_in and not raw_in.startswith(allowed_prefixes):
+                raise ValueError(
+                    f"Insumo {insumo.id_o_ruta!r} pertenece a otro encargo o ruta prohibida para {self.encargo!r}."
+                )
         return self
 
 
@@ -389,6 +439,30 @@ class FindingContract(StrictContractModel):
     contrahipotesis_probadas: int = Field(ge=0)
     que_lo_refutaria: str = Field(min_length=10)
     promovible_a_capital: bool = False
+
+    @field_validator("sustento_evidencia", "sustento_derivaciones")
+    @classmethod
+    def _validar_sustentos_canonicos(cls, refs: list[str]) -> list[str]:
+        for raw_ref in refs:
+            raw = str(raw_ref).strip()
+            if "/" in raw or "\\" in raw:
+                raise ValueError(
+                    f"Referencia de sustento con ruta transversal o separador prohibido ({raw_ref!r}): "
+                    "solo se permiten IDs canónicos como [[E-...]], [[EI-...]], [[D-...]], [[H-...]] o [[C-...]]."
+                )
+            bare = extract_wikilink_id(raw)
+            if (
+                not bare
+                or ".." in raw.replace("\\", "/").split("/")
+                or "/" in bare
+                or "\\" in bare
+                or not SAFE_SUSTENTO_ID_RE.fullmatch(bare)
+            ):
+                raise ValueError(
+                    f"Referencia de sustento inválida o con ruta transversal ({raw_ref!r}): "
+                    "solo se permiten IDs canónicos como [[E-...]], [[EI-...]], [[D-...]], [[H-...]] o [[C-...]]."
+                )
+        return refs
 
     @field_validator("metodo")
     @classmethod

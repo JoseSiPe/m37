@@ -602,6 +602,7 @@ def generate_plan_from_archetype(
     approve_gate_2: bool = False,
     harness_mode: bool = False,
     approver: str = "socio_humano",
+    motivo_replanificacion: str | None = None,
     env: Mapping[str, str] | None = None,
     completion_fn: Callable[..., Any] | None = None,
 ) -> tuple[Path, list[Path]]:
@@ -620,6 +621,24 @@ def generate_plan_from_archetype(
             "No se permite combinar --orchestrator con --approve-gate-2: "
             "el plan generado o modificado por un LLM Orquestador requiere revisión humana antes de aprobar Puerta 2."
         )
+
+    existing_plan_path = enc_dir / "01_Plan.md"
+    clean_motivo = (
+        motivo_replanificacion.strip()
+        if isinstance(motivo_replanificacion, str) and motivo_replanificacion.strip()
+        else None
+    )
+    next_version = 1
+    if existing_plan_path.is_file():
+        gate_2_already_ok, _ = evaluate_gate_2(enc_dir)
+        prev_plan_meta, _ = parse_raw_artifact(existing_plan_path.read_text(encoding="utf-8"), suffix=".md")
+        if gate_2_already_ok and not clean_motivo:
+            raise PermissionError(
+                "01_Plan.md ya cuenta con Puerta 2 aprobada; para replanificar debes indicar "
+                "`motivo_replanificacion` (invalidará la Puerta 2 hasta nueva aprobación humana)."
+            )
+        if clean_motivo:
+            next_version = int(prev_plan_meta.get("version") or 1) + 1
 
     brief_obj, brief_meta, brief_body = validate_artifact_content(
         brief_path.read_text(encoding="utf-8"),
@@ -708,6 +727,7 @@ def generate_plan_from_archetype(
             "contrato_aceptacion": ["Cumplir esquema Pydantic v2 y trazabilidad verificable en Fase A y Fase B."],
             "criterio_suficiencia": spec_node.criterio_suficiencia,
             "depende_de": list(spec_node.depende_de),
+            "timeout_segundos": spec_node.timeout_segundos,
             "riesgo": "alto" if rigor in ("L3", "L4") else "medio",
             "estado": "pendiente",
             "rondas_qa": 0,
@@ -730,9 +750,9 @@ def generate_plan_from_archetype(
 
     plan_meta: dict[str, Any] = {
         "tipo": "plan",
-        "id_plan": f"PLAN-{engagement_id}-v1",
-        "version": 1,
-        "motivo_replanificacion": None,
+        "id_plan": f"PLAN-{engagement_id}-v{next_version}",
+        "version": next_version,
+        "motivo_replanificacion": clean_motivo,
         "encargo": engagement_id,
         "arquetipo_base": arq_contract.id_arquetipo,
         "nodos": node_ids,
@@ -805,6 +825,9 @@ def generate_plan_from_archetype(
         )
         assert isinstance(re_plan_obj, PlanContract)
         # LLM Orchestrator plans ALWAYS require human review for Gate 2
+        re_plan_meta["version"] = next_version
+        re_plan_meta["id_plan"] = f"PLAN-{engagement_id}-v{next_version}"
+        re_plan_meta["motivo_replanificacion"] = clean_motivo
         re_plan_meta["puerta_2_aprobada"] = False
         re_plan_meta["puerta_2_sha256"] = None
         write_utf8_lf(plan_path, dump_markdown_note(re_plan_meta, re_plan_body))
@@ -1095,6 +1118,7 @@ def run_engagement(
             base_env=effective_env,
             web_allowed_domains=tuple(brief_obj.dominios_web_permitidos),
             web_requires_allowlist=brief_obj.nivel_rigor in ("L3", "L4"),
+            default_timeout_s=node_obj.timeout_segundos,
         )
 
         node_budget_limit = node_obj.enrutamiento_modelo.presupuesto_max_usd
@@ -1149,7 +1173,7 @@ def run_engagement(
                 approved_r1 = False
             else:
                 final_node_state = "aceptado"
-                approved_r1 = True
+                approved_r1 = None if resolved_routing.qa_entry is None else True
 
         written_findings = [
             paths.workspace_root / rel
@@ -1405,8 +1429,8 @@ def run_engagement(
                             _set_finding_qa_state(hpath, "rechazado")
                             final_node_state = "escalado_humano"
                 else:
-                    _set_finding_qa_state(hpath, "aprobado")
-                    veredicto_qa_r1_str = "aceptar"
+                    veredicto_qa_r1_str = None
+                    approved_r1 = None
 
         node_meta["estado"] = final_node_state
         write_utf8_lf(npath, dump_markdown_note(node_meta, node_body))
@@ -1913,13 +1937,49 @@ def close_engagement(
     )
     assert isinstance(brief_obj, BriefContract)
 
-    # Collect all client names in 10_Clientes/ + brief.cliente + engagement_id to block confidentiality leaks into 50_Capital/
+    # Collect all client names and registered aliases in 10_Clientes/*/Perfil.md + brief.cliente + engagement_id
+    # to block confidentiality leaks into 50_Capital/.
     forbidden_tokens = {brief_obj.cliente.strip(), engagement_id.strip()}
     clients_root = paths.vault_root / "10_Clientes"
+    _ignored_alias_tokens = {"n/a", "na", "ninguno", "ninguna", "none", "-", "null"}
     if clients_root.is_dir():
         for cdir in clients_root.iterdir():
-            if cdir.is_dir() and len(cdir.name.strip()) >= 2:
+            if not cdir.is_dir():
+                continue
+            if len(cdir.name.strip()) >= 2:
                 forbidden_tokens.add(cdir.name.strip())
+            perfil_path = cdir / "Perfil.md"
+            if not perfil_path.is_file():
+                continue
+            try:
+                p_meta, p_body = parse_raw_artifact(perfil_path.read_text(encoding="utf-8"), suffix=".md")
+            except ContractValidationError:
+                p_meta, p_body = {}, perfil_path.read_text(encoding="utf-8", errors="replace")
+            for key in ("alias", "aliases", "razon_social", "marcas"):
+                val = p_meta.get(key)
+                items = val if isinstance(val, list) else ([val] if isinstance(val, str) else [])
+                for item in items:
+                    raw_item = str(item).strip().strip("`\"'*")
+                    if len(raw_item) >= 2 and raw_item.lower() not in _ignored_alias_tokens:
+                        forbidden_tokens.add(raw_item)
+                    for tok in re.split(r"[,;/|]", raw_item):
+                        clean = tok.strip().strip("`\"'*")
+                        if len(clean) >= 2 and clean.lower() not in _ignored_alias_tokens:
+                            forbidden_tokens.add(clean)
+            for line in p_body.splitlines():
+                m_alias = re.match(
+                    r"^\s*(?:[-*]\s*)?(?:alias(?:es)?|raz[oó]n\s+social|marcas?)\s*:\s*(.+)$",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                if m_alias:
+                    raw_line = m_alias.group(1).strip().strip("`\"'*")
+                    if len(raw_line) >= 2 and raw_line.lower() not in _ignored_alias_tokens:
+                        forbidden_tokens.add(raw_line)
+                    for tok in re.split(r"[,;/|]", raw_line):
+                        clean = tok.strip().strip("`\"'*")
+                        if len(clean) >= 2 and clean.lower() not in _ignored_alias_tokens:
+                            forbidden_tokens.add(clean)
 
     # Match across underscores/hyphens/punctuation (e.g. 'ACME_latam' or 'ACME-2026' is still caught)
     leak_patterns = [
@@ -2140,6 +2200,11 @@ def cli_plan(
     ),
     approve_gate_1: bool = typer.Option(False, "--approve-gate-1", help="Aprobar Puerta 1 automáticamente."),
     approve_gate_2: bool = typer.Option(False, "--approve-gate-2", help="Aprobar Puerta 2 automáticamente."),
+    motivo: str | None = typer.Option(
+        None,
+        "--motivo",
+        help="Motivo de replanificación si 01_Plan.md ya cuenta con Puerta 2 aprobada.",
+    ),
     harness: bool = typer.Option(
         False,
         "--harness",
@@ -2160,6 +2225,7 @@ def cli_plan(
             approve_gate_2=approve_gate_2,
             orchestrator=orchestrator,
             harness_mode=harness,
+            motivo_replanificacion=motivo,
         )
     except (RoutingGuardrailError, PermissionError) as exc:
         console.print(f"[bold red]PLANIFICACIÓN BLOQUEADA:[/bold red] {exc}")
@@ -2387,14 +2453,17 @@ def cli_close(
     id_encargo: str = typer.Argument(..., help="ID del encargo a cerrar."),
     leccion: str = typer.Option("Encargo concluido satisfactoriamente.", "--leccion", "-l"),
     promote_capital: bool = typer.Option(
-        True,
+        False,
         "--promote-capital/--no-promote-capital",
-        help="Promover hallazgos marcados con promovible_a_capital=true tras validar ausencia de nombres de clientes.",
+        help="Promover hallazgos marcados con promovible_a_capital=true tras revisión humana de anonimización.",
     ),
     vault: Path | None = typer.Option(None, "--vault"),
 ) -> None:
-    """Cierra un encargo, genera ficha episódica Nivel 1 y promueve capital anonimizado a 50_Capital/."""
+    """Cierra un encargo y genera ficha episódica Nivel 1 (promoción a 50_Capital/ requiere --promote-capital interactivo)."""
     paths = resolve_workspace_paths(vault)
+    if promote_capital:
+        gates.require_interactive_human("m37 close --promote-capital")
+        gates.assert_gate_1(paths.engagement_dir(id_encargo))
     try:
         summary = close_engagement(paths, id_encargo, leccion=leccion, promote_capital=promote_capital)
     except ClientLeakInCapitalError as exc:

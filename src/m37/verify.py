@@ -121,6 +121,10 @@ def verify_sdd_code_derivation(
         errors.append(
             f"La suite de tests falló en el recibo del microkernel (exit_code={receipt.get('exit_code')!r} != 0)."
         )
+    if receipt.get("full_suite") is False:
+        errors.append(
+            "El recibo de verificación corresponde a una ejecución parcial (`full_suite=false`), no a la suite completa."
+        )
 
     cmd_str = str(receipt.get("command") or "").strip()
     cmd_tokens = cmd_str.split()
@@ -186,6 +190,13 @@ def verify_sdd_code_derivation(
         return errors
 
     bare_tests, qualified_tests = _collect_existing_test_functions(code_dir)
+    passed_tests_raw = receipt.get("passed_tests")
+    has_passed_tests_receipt = isinstance(passed_tests_raw, list)
+    passed_set = (
+        {str(x).strip() for x in passed_tests_raw if str(x).strip()}
+        if has_passed_tests_receipt
+        else set()
+    )
 
     for rf_id in sorted(required_rfs):
         mapped = cobertura.get(rf_id)
@@ -201,6 +212,12 @@ def verify_sdd_code_derivation(
                 errors.append(
                     f"El test {tref!r} declarado para {rf_id} no existe como función 'def {fn_part}(...)' en codigo/{engagement_id}/."
                 )
+            elif has_passed_tests_receipt:
+                test_passed = (tref in passed_set) if "::" in tref else (fn_part in passed_set)
+                if not test_passed:
+                    errors.append(
+                        f"El test {tref!r} declarado para {rf_id} no figura como 'passed' en la corrida JUnit del recibo {RECEIPT_FILENAME}."
+                    )
 
     return errors
 
@@ -365,6 +382,18 @@ def verify_derivation_phase_a(
         elif sha256_file(script_file) != validated.productor_sha256:
             errors.append(f"El script {validated.productor_ref!r} cambió respecto a productor_sha256.")
         elif rerun or rigor in ("L3", "L4"):
+            found_timeouts: list[int] = []
+            nodos_dir = paths.engagement_dir(engagement_id) / "Nodos"
+            if nodos_dir.is_dir():
+                for np in nodos_dir.glob("N-*.md"):
+                    try:
+                        n_meta, _ = parse_raw_artifact(np.read_text(encoding="utf-8"), suffix=".md")
+                        raw_t = n_meta.get("timeout_segundos")
+                        if isinstance(raw_t, int) and 5 <= raw_t <= 600:
+                            found_timeouts.append(raw_t)
+                    except ContractValidationError:
+                        pass
+            node_timeout_s = max(found_timeouts) if found_timeouts else 60
             guard = ExecutionGuard(
                 paths,
                 AgentExecutionContext(
@@ -372,6 +401,7 @@ def verify_derivation_phase_a(
                     client_id="VERIFY",
                     node_id="VERIFY-RERUN",
                     profile="analitico",
+                    default_timeout_s=node_timeout_s,
                 ),
             )
             try:

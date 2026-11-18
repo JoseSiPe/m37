@@ -486,10 +486,10 @@ def execute_stateless_node_loop(
                 TypeError,
             ) as exc:
                 err_msg = f"ERROR_GUARDIA ({type(exc).__name__}): {exc}"
-                if isinstance(exc, (GuardViolationError, ValueError, KeyError, TypeError)):
-                    guard_violations.append(err_msg)
                 if isinstance(exc, ContractValidationError):
                     contract_errors += 1
+                elif isinstance(exc, (GuardViolationError, ValueError, KeyError, TypeError)):
+                    guard_violations.append(err_msg)
                 tool_output = err_msg
             except Exception as exc:  # noqa: BLE001 - P8: never crash node loop on unexpected tool error
                 tool_output = f"ERROR_HERRAMIENTA ({type(exc).__name__}): {exc}"

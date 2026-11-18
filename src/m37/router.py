@@ -193,7 +193,11 @@ def compute_episodic_rejection_rates(
         ev_dom = str(ev.get("dominio") or "").strip().lower()
         ev_met = str(ev.get("metodo") or "").strip().lower().strip("[]")
         if dom_norm or met_norm:
-            matches_dom = bool(dom_norm and ev_dom and (ev_dom == dom_norm or ev_dom.startswith(dom_norm) or dom_norm.startswith(ev_dom)))
+            matches_dom = bool(
+                dom_norm
+                and ev_dom
+                and (ev_dom == dom_norm or ev_dom.removesuffix("-base") == dom_norm.removesuffix("-base"))
+            )
             matches_met = bool(met_norm and ev_met and ev_met == met_norm)
             if not (matches_dom or matches_met):
                 continue

@@ -237,7 +237,11 @@ def filter_active_models(
 def check_privacy_gate(rigor: RigorLevel, env: Mapping[str, str]) -> None:
     """SPEC-01 §5: Abort L3/L4 execution before sending any token if paid_billing is not acknowledged."""
     ack = env.get("M37_DATA_PRIVACY_ACK", "demo_only").strip()
-    if rigor in ("L3", "L4") and ack != "paid_billing":
+    ollama_only = env.get("M37_ENABLE_LOCAL_OLLAMA", "").strip() == "1" and not any(
+        env.get(k, "").strip()
+        for k in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")
+    )
+    if rigor in ("L3", "L4") and ack != "paid_billing" and not ollama_only:
         raise PrivacyGateError(
             f"BLOQUEO DE PRIVACIDAD ({rigor}): M37_DATA_PRIVACY_ACK={ack!r}. "
             "Los encargos L3/L4 de clientes reales exigen APIs con facturación vinculada "

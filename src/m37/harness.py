@@ -49,7 +49,7 @@ name: m37
 description: Opera un encargo de M37 (Move 37) sobre un Vault Markdown desde Antigravity, Claude Code o Codex CLI usando el servidor MCP m37-kernel. Úsalo cuando el usuario mencione M37, Move 37, encargos L1-L4, 00_Brief.md, 01_Plan.md, Hallazgos H-*, Derivaciones D-*, QA ciego o compilación de entregables.
 ---
 
-# M37 (Move 37) — Skill para harness (`v0.2.0`)
+# M37 (Move 37) — Skill para harness (`v{__VERSION__}`)
 
 Permite trabajar un encargo de M37 con el modelo del harness anfitrión (Antigravity, Claude Code o Codex CLI) sin llaves API para los nodos productivos.
 
@@ -101,7 +101,7 @@ Cada llamada a `m37_write_artifact` lleva el `node_id` del nodo que estás ejecu
 1. En el nodo editorial usa `![[H-...#Afirmación]] <!-- sustento: H-... -->` e interpola cifras con `{{D-XX.clave}}`.
 2. `m37_verify_and_compile(id_encargo=..., output_format="html")`.
 3. Dile a la persona que el compilador verifica anclajes y linaje, no que la prosa diga lo mismo que cada hallazgo: esa lectura final es suya.
-"""
+""".replace("{__VERSION__}", __version__)
 
 AGY_QA_AGENT_MARKDOWN = """---
 name: m37-qa-ciego
@@ -394,7 +394,9 @@ def _upsert_codex_config_toml(config_path: Path, *, python_cmd: str, repo_root: 
     else:
         sep = "\n\n" if existing.strip() else ""
         updated = existing.rstrip() + sep + block
-    write_utf8_lf(config_path, updated)
+    if config_path.is_file() and updated != existing:
+        _backup_once(config_path)
+    _atomic_write(config_path, updated)
 
 
 def _upsert_claude_global_mcp(claude_json_path: Path, *, python_cmd: str, repo_root: Path | None = None) -> None:

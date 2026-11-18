@@ -72,9 +72,9 @@ UNCONDITIONED_GUARANTEE_RE = re.compile(
     re.IGNORECASE,
 )
 PROSE_QUANT_METRIC_RE = re.compile(
-    r"(?:(?:USD|MXN|EUR|\$)\s*\d+(?:[.,]\d+)?\s*(?:M|MM|K|B|millones|mil)?\b"
-    r"|\b\d+(?:[.,]\d+)?\s*%"
-    r"|\b\d+(?:[.,]\d+)?\s+(?:meses|años)\b)",
+    r"(?:(?:USD|MXN|EUR|\$)\s*\d+(?:[.,]\d+)*\s*(?:M|MM|K|B|millones|mil)?\b"
+    r"|\b\d+(?:[.,]\d+)*\s*%"
+    r"|\b\d+(?:[.,]\d+)*\s+(?:meses|años)\b)",
     re.IGNORECASE,
 )
 
@@ -104,8 +104,28 @@ def find_active_markup_violation(text: str) -> str | None:
     return None
 
 
+def _normalize_number_token(raw: str) -> str:
+    """Normalize numeric strings distinguishing US/MX vs EU thousands separators."""
+    s = raw.strip()
+    if not s:
+        return s
+    has_comma = "," in s
+    has_dot = "." in s
+    if has_comma and has_dot:
+        if s.rfind(".") > s.rfind(","):
+            return s.replace(",", "")
+        return s.replace(".", "").replace(",", ".")
+    if has_comma:
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+", s):
+            return s.replace(",", "")
+        return s.replace(",", ".")
+    if has_dot and s.count(".") > 1 and re.fullmatch(r"\d{1,3}(?:\.\d{3})+", s):
+        return s.replace(".", "")
+    return s
+
+
 def _numeric_variants(raw_number: str) -> set[str]:
-    norm = raw_number.replace(",", ".")
+    norm = _normalize_number_token(raw_number)
     variants = {norm}
     try:
         fval = float(norm)
@@ -180,8 +200,8 @@ def find_unanchored_numbers(prose: str, allowed: set[Any]) -> list[str]:
 def _extract_numeric_tokens(text: str) -> set[str]:
     """Extract normalized numeric tokens (e.g. '2.45', '18.4', '12', '20') from text/values."""
     tokens: set[str] = set()
-    for m in re.finditer(r"\d+(?:[.,]\d+)?", text):
-        norm = m.group(0).replace(",", ".")
+    for m in re.finditer(r"\d+(?:[.,]\d+)*", text):
+        norm = _normalize_number_token(m.group(0))
         tokens.add(norm)
         try:
             fval = float(norm)
@@ -609,7 +629,7 @@ def compile_deliverable(
                 der_p = resolve_artifact_by_id(paths, engagement_id, der_ref)
                 der_meta_n, _ = parse_raw_artifact(der_p.read_text(encoding="utf-8"), suffix=der_p.suffix)
                 allowed_nums.update(
-                    classed_numbers_from_values([der_meta_n.get("salidas") or {}, der_meta_n.get("metadatos_metodo") or {}])
+                    classed_numbers_from_values([der_meta_n.get("salidas") or {}])
                 )
             except (FileNotFoundError, ContractValidationError):
                 pass
@@ -916,15 +936,19 @@ def compile_deliverable(
     body_html = HTML_UNSAFE_HREF_RE.sub(lambda m: f'{m.group(1)}="#"', body_html)
     footnotes_html = ""
     if footnote_records:
+        import urllib.parse
+
         items_html = []
         for rec in footnote_records:
             t_esc = html.escape(str(rec["titulo"]))
             a_esc = html.escape(str(rec["emisor_o_autor"]))
             l_esc = html.escape(str(rec["localizador_verificable"]))
             v_esc = html.escape(str(rec["fecha_verificacion"]))
+            raw_url = str(rec.get("url") or "").strip()
+            url_scheme = urllib.parse.urlsplit(raw_url).scheme.lower() if raw_url else ""
             url_part = (
-                f' · <a href="{html.escape(str(rec["url"]), quote=True)}">Enlace fuente</a>'
-                if rec.get("url")
+                f' · <a href="{html.escape(raw_url, quote=True)}">Enlace fuente</a>'
+                if raw_url and url_scheme in ("http", "https")
                 else ""
             )
             items_html.append(
@@ -959,6 +983,7 @@ def compile_deliverable(
         "</body>\n"
         "</html>\n"
     )
+    final_html = HTML_UNSAFE_HREF_RE.sub(lambda m: f'{m.group(1)}="#"', final_html)
 
     out_dir = paths.render_root / engagement_id
     out_dir.mkdir(parents=True, exist_ok=True)

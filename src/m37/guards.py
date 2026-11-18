@@ -47,6 +47,9 @@ EXCLUDED_CODE_DIRS = frozenset(
         ".venv",
         "venv",
         "node_modules",
+        ".obsidian",
+        ".trash",
+        ".indice",
     }
 )
 
@@ -146,6 +149,7 @@ class AgentExecutionContext:
     web_requires_allowlist: bool = False
     # C2: "container" | "process" | None (resolve from M37_SANDBOX_BACKEND, default "auto").
     sandbox_backend: str | None = None
+    default_timeout_s: int = 60
 
 
 def write_utf8_lf(path: Path, content: str) -> None:
@@ -310,16 +314,59 @@ def is_artifact_quarantined(path: Path) -> tuple[bool, str | None]:
     return False, None
 
 
+def _rel_parts_casefold(root: Path, target: Path) -> tuple[str, ...] | None:
+    """Return relative parts from `root` to `target` using case-insensitive segment matching (APFS/NTFS safe)."""
+    r_parts = tuple(os.path.normcase(p).casefold() for p in root.resolve().parts)
+    t_res_parts = target.resolve().parts
+    t_parts = tuple(os.path.normcase(p).casefold() for p in t_res_parts)
+    if len(t_parts) < len(r_parts):
+        return None
+    if t_parts[: len(r_parts)] != r_parts:
+        return None
+    return t_res_parts[len(r_parts) :]
+
+
+def _is_forbidden_global_artifact_path(paths: WorkspacePaths, target: Path) -> bool:
+    """Block artifact resolution inside 10_Clientes/, 90_Bitacora/, or .indice/ across engagements."""
+    forbidden_roots = (
+        paths.vault_root / "10_Clientes",
+        paths.vault_root / "90_Bitacora",
+        paths.vault_root / ".indice",
+    )
+    return any(_rel_parts_casefold(r, target) is not None for r in forbidden_roots)
+
+
 def resolve_artifact_by_id(
     paths: WorkspacePaths,
     engagement_id: str | None,
     raw_id: str,
 ) -> Path:
     """Resolve an artifact bare ID or [[wikilink]] to its canonical Path inside the workspace."""
-    bare_id = extract_wikilink_id(raw_id)
-    candidates: list[Path] = []
+    raw_trimmed = str(raw_id).strip()
+    if not raw_trimmed or "\\" in raw_trimmed or raw_trimmed.startswith("/") or ".." in raw_trimmed.split("/"):
+        raise FileNotFoundError(
+            f"Referencia de artefacto rechazada por seguridad (ruta transversal): {raw_id!r}."
+        )
+    bare_id = extract_wikilink_id(raw_trimmed)
+    if not bare_id or "\\" in bare_id or bare_id.startswith("/") or ".." in bare_id.split("/"):
+        raise FileNotFoundError(
+            f"Identificador de artefacto rechazado por seguridad: {raw_id!r}."
+        )
 
-    if engagement_id:
+    def _is_allowed_candidate(cand: Path) -> bool:
+        if not cand.is_file():
+            return False
+        resolved_cand = cand.resolve()
+        if _rel_parts_casefold(paths.workspace_root, resolved_cand) is None:
+            return False
+        if _is_forbidden_global_artifact_path(paths, resolved_cand):
+            return False
+        if engagement_id and _belongs_to_other_engagement(paths, engagement_id, resolved_cand):
+            return False
+        return True
+
+    candidates: list[Path] = []
+    if engagement_id and "/" not in bare_id:
         enc_dir = paths.engagement_dir(engagement_id)
         candidates.extend(
             [
@@ -332,35 +379,36 @@ def resolve_artifact_by_id(
                 enc_dir / f"{bare_id}.md",
             ]
         )
-        # Also allow relative paths inside datos/<encargo>/ or analisis/<encargo>/ or codigo/<encargo>/
+
+    if engagement_id and not raw_trimmed.startswith("[["):
+        # Direct relative paths are restricted strictly to the active engagement perimeter
         for extra_base in (
             paths.datos_root / engagement_id,
             paths.analisis_root / engagement_id,
             paths.codigo_root / engagement_id,
             paths.workspace_root,
         ):
-            direct = (extra_base / raw_id.strip()).resolve()
-            if (
-                direct.is_file()
-                and paths.workspace_root in (direct, *direct.parents)
-                and not _belongs_to_other_engagement(paths, engagement_id, direct)
-            ):
+            direct = (extra_base / raw_trimmed).resolve()
+            if _is_allowed_candidate(direct):
                 candidates.append(direct)
 
     pub_dir = paths.vault_root / "30_Evidencia_Publica"
-    candidates.append(pub_dir / f"{bare_id}.md")
-    candidates.append(paths.vault_root / "40_Metodos" / f"{bare_id}.md")
+    if "/" not in bare_id:
+        candidates.append(pub_dir / f"{bare_id}.md")
+        candidates.append(paths.vault_root / "40_Metodos" / f"{bare_id}.md")
 
     for candidate in candidates:
-        if candidate.is_file():
+        if _is_allowed_candidate(candidate):
             return candidate.resolve()
 
-    # Recursive fallback in 30_Evidencia_Publica and 50_Capital
-    for shared_dir in (pub_dir, paths.vault_root / "50_Capital"):
-        if shared_dir.is_dir():
-            matches = list(shared_dir.rglob(f"{bare_id}.md"))
-            if matches:
-                return matches[0].resolve()
+    # Recursive fallback in 30_Evidencia_Publica and 50_Capital (canonical bare IDs only)
+    if "/" not in bare_id:
+        for shared_dir in (pub_dir, paths.vault_root / "50_Capital"):
+            if shared_dir.is_dir():
+                matches = list(shared_dir.rglob(f"{bare_id}.md"))
+                for match in matches:
+                    if _is_allowed_candidate(match):
+                        return match.resolve()
 
     raise FileNotFoundError(
         f"No se pudo resolver el artefacto {raw_id!r} (ID normalizado: {bare_id!r}) en el encargo {engagement_id!r}."
@@ -376,20 +424,18 @@ def _belongs_to_other_engagement(paths: WorkspacePaths, engagement_id: str, targ
         paths.datos_root,
         paths.render_root,
     )
+    eng_cf = engagement_id.casefold()
     for root in scoped_roots:
-        r_res = root.resolve()
-        if r_res in resolved.parents:
-            rel_parts = resolved.relative_to(r_res).parts
-            if rel_parts and rel_parts[0] != engagement_id:
-                return True
+        rel_parts = _rel_parts_casefold(root, resolved)
+        if rel_parts is not None and len(rel_parts) >= 1 and rel_parts[0].casefold() != eng_cf:
+            return True
     # referencias/<encargo>/ is engagement-scoped; referencias/_publico/ holds snapshots of public web pages shared by
     # 30_Evidencia_Publica/. Anything else directly under referencias/ (including the kernel registry) is off limits.
-    ref_res = paths.referencias_root.resolve()
-    if ref_res in resolved.parents:
-        rel_parts = resolved.relative_to(ref_res).parts
-        if rel_parts and rel_parts[0] not in (engagement_id, PUBLIC_SNAPSHOT_DIRNAME):
+    rel_ref = _rel_parts_casefold(paths.referencias_root, resolved)
+    if rel_ref is not None and len(rel_ref) >= 1:
+        if len(rel_ref) == 1 and not resolved.is_dir():
             return True
-        if len(rel_parts) == 1 and not resolved.is_dir():
+        if rel_ref[0].casefold() not in (eng_cf, PUBLIC_SNAPSHOT_DIRNAME.casefold()):
             return True
     return False
 
@@ -634,7 +680,8 @@ def _validate_public_http_url(url: str) -> str:
     def _check_ip(ip_str: str) -> None:
         ip_obj = ipaddress.ip_address(ip_str)
         if (
-            ip_obj.is_private
+            not ip_obj.is_global
+            or ip_obj.is_private
             or ip_obj.is_loopback
             or ip_obj.is_link_local
             or ip_obj.is_multicast
@@ -777,40 +824,38 @@ class ExecutionGuard:
         if raw.is_absolute():
             resolved = raw.resolve()
         else:
-            # Allow paths relative to vault_root if starting with vault folders, else workspace_root
+            # Allow paths relative to vault_root if starting with vault folders (case-insensitive for macOS APFS), else workspace_root
             first_part = raw.parts[0] if raw.parts else ""
-            vault_top_dirs = {
-                "00_Sistema",
-                "10_Clientes",
-                "20_Encargos",
-                "30_Evidencia_Publica",
-                "40_Metodos",
-                "50_Capital",
-                "90_Bitacora",
+            vault_top_dirs_cf = {
+                "00_sistema",
+                "10_clientes",
+                "20_encargos",
+                "30_evidencia_publica",
+                "40_metodos",
+                "50_capital",
+                "90_bitacora",
             }
-            if first_part in vault_top_dirs:
+            if first_part.casefold() in vault_top_dirs_cf:
                 resolved = (self.paths.vault_root / raw).resolve()
             else:
                 resolved = (self.paths.workspace_root / raw).resolve()
 
-        ws_root = self.paths.workspace_root.resolve()
-        if resolved != ws_root and ws_root not in resolved.parents:
+        if _rel_parts_casefold(self.paths.workspace_root, resolved) is None:
             raise PermissionDeniedError(
                 f"Acceso fuera del perímetro del workspace bloqueado: {str(rel_or_abs)!r}"
             )
-        if resolved.name == ".env" or resolved.name.startswith(".env."):
+        if resolved.name.casefold() == ".env" or resolved.name.casefold().startswith(".env."):
             raise PermissionDeniedError("Lectura o escritura de archivos .env estrictamente prohibida.")
         return resolved
 
     def _enforce_chinese_wall(self, resolved: Path) -> None:
         """SPEC-02 §3.2 Rule 1: Isolate clients (10_Clientes) and engagements (20_Encargos, analisis, codigo, datos, render)."""
-        clients_dir = (self.paths.vault_root / "10_Clientes").resolve()
-        if clients_dir in resolved.parents:
-            rel_parts = resolved.relative_to(clients_dir).parts
-            if rel_parts and rel_parts[0] != self.ctx.client_id:
+        rel_client_parts = _rel_parts_casefold(self.paths.vault_root / "10_Clientes", resolved)
+        if rel_client_parts is not None and len(rel_client_parts) >= 1:
+            if rel_client_parts[0].casefold() != self.ctx.client_id.casefold():
                 raise PermissionDeniedError(
                     f"Violación de Muralla China (cliente): el encargo de {self.ctx.client_id!r} "
-                    f"no puede acceder a 10_Clientes/{rel_parts[0]}/."
+                    f"no puede acceder a 10_Clientes/{rel_client_parts[0]}/."
                 )
 
         if _belongs_to_other_engagement(self.paths, self.ctx.engagement_id, resolved):
@@ -822,10 +867,10 @@ class ExecutionGuard:
     def _is_episodic_memory_path(self, resolved: Path) -> bool:
         """Arquitectura §5: 90_Bitacora/ (episodios.jsonl, EP-*.md) y vault/.indice/ (grafo.duckdb) son memoria episódica."""
         episodic_roots = (
-            (self.paths.vault_root / "90_Bitacora").resolve(),
-            (self.paths.vault_root / ".indice").resolve(),
+            self.paths.vault_root / "90_Bitacora",
+            self.paths.vault_root / ".indice",
         )
-        return any(resolved == r or r in resolved.parents for r in episodic_roots)
+        return any(_rel_parts_casefold(r, resolved) is not None for r in episodic_roots)
 
     def _enforce_episodic_isolation(self, resolved: Path) -> None:
         """Solo el Orquestador tiene acceso (completo) a la memoria episódica; tarea, editorial y QA: sin acceso."""
@@ -1584,16 +1629,51 @@ class ExecutionGuard:
                 shell=False,
                 capture_output=True,
                 text=True,
-                timeout=min(max(timeout_s, 1), 60) + 20,  # margen para el arranque del contenedor
+                timeout=min(max(timeout_s, 1), 600) + 20,  # margen para el arranque del contenedor
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
             subprocess.run([runtime, "kill", name], capture_output=True, text=True, timeout=20, check=False)
             raise PermissionDeniedError(f"Timeout en {label} (backend container); contenedor {name} detenido.") from exc
 
-    def run_verification_cmd(self, cmd: list[str] | str, timeout_s: int = 60) -> dict[str, Any]:
+    @staticmethod
+    def _parse_junit_passed_tests(junit_path: Path, code_dir: Path) -> set[str]:
+        import xml.etree.ElementTree as ET
+
+        passed_qualified: set[str] = set()
+        passed_bare: set[str] = set()
+        failed_or_skipped_bare: set[str] = set()
+        if not junit_path.is_file():
+            return set()
+        try:
+            tree = ET.parse(junit_path)
+        except ET.ParseError:
+            return set()
+        for tc in tree.iter("testcase"):
+            raw_name = (tc.attrib.get("name") or "").strip()
+            if not raw_name:
+                continue
+            bare_fn = raw_name.split("[", 1)[0]
+            cls_attr = (tc.attrib.get("classname") or "").strip()
+            has_non_pass = any(child.tag in ("skipped", "failure", "error") for child in tc)
+            if has_non_pass:
+                failed_or_skipped_bare.add(bare_fn)
+                continue
+
+            passed_bare.add(bare_fn)
+            cls_parts = [p for p in cls_attr.split(".") if p]
+            for cut in range(len(cls_parts), 0, -1):
+                rel_py = Path(*cls_parts[:cut]).with_suffix(".py")
+                if (code_dir / rel_py).is_file():
+                    passed_qualified.add(f"{rel_py.as_posix()}::{bare_fn}")
+                    passed_qualified.add(f"{rel_py.name}::{bare_fn}")
+                    break
+        return passed_qualified | (passed_bare - failed_or_skipped_bare)
+
+    def run_verification_cmd(self, cmd: list[str] | str, timeout_s: int | None = None) -> dict[str, Any]:
         """Run pytest/ruff/mypy/unittest inside codigo/<encargo>/ with audit-hook + snapshot rollback protection (P7)."""
         self._require_tool_permission("run_verification_cmd")
+        eff_timeout_s = self.ctx.default_timeout_s if timeout_s is None else timeout_s
         if not self.ctx.allow_compute:
             raise PermissionDeniedError(
                 f"El nodo {self.ctx.node_id!r} tiene requiere_computo=False; ejecución de comandos deshabilitada."
@@ -1639,13 +1719,47 @@ class ExecutionGuard:
             "-V",
             "-h",
             "--help",
+            "-k",
+            "-m",
+            "--deselect",
+            "--ignore",
+            "--ignore-glob",
+            "--lf",
+            "--last-failed",
+            "--ff",
+            "--failed-first",
+            "--nf",
+            "--new-first",
+            "--stepwise",
+            "--sw",
+            "-x",
+            "--exitfirst",
+            "--maxfail",
+            "--junitxml",
+            "--junit-xml",
         }
+        options_with_value = {"--rootdir", "--tb", "--color", "--capture", "-o", "--override-ini"}
+        skip_next = False
         for arg in tool_args:
+            if skip_next:
+                skip_next = False
+                continue
             arg_head = arg.split("=", 1)[0].strip()
-            if arg_head in forbidden_verify_flags:
+            if arg_head in forbidden_verify_flags or (
+                tool_mod == "pytest" and len(arg_head) > 2 and arg_head.startswith(("-k", "-m"))
+            ):
                 raise PermissionDeniedError(
-                    f"Flag prohibida en run_verification_cmd ({arg!r}): las pruebas deben ejecutarse realmente."
+                    f"Flag prohibida en run_verification_cmd ({arg!r}): debe ejecutarse la suite completa sin filtros."
                 )
+            if "=" not in arg and arg_head in options_with_value:
+                skip_next = True
+                continue
+            if tool_mod == "pytest" and not arg.startswith("-"):
+                if arg.rstrip("/") not in (".", "tests"):
+                    raise PermissionDeniedError(
+                        f"Argumento de filtro no permitido en run_verification_cmd ({arg!r}): "
+                        "debe ejecutarse la suite completa sin seleccionar archivos o tests individuales."
+                    )
 
         backend, runtime = self._resolve_sandbox_backend()
         ro_evidence_roots = (
@@ -1655,33 +1769,43 @@ class ExecutionGuard:
         )
         src_candidate = code_root / "src"
         proc: subprocess.CompletedProcess[str] | None = None
+        passed_tests: list[str] | None = None
 
         if backend == "container":
             assert runtime is not None
             c_args = list(tool_args)
+            container_junit = code_root / ".m37_junit_tmp.xml"
+            container_junit.unlink(missing_ok=True)
             if tool_mod == "pytest":
                 if not any(a.startswith("--rootdir") for a in c_args):
                     c_args = [f"--rootdir={self._container_path(code_root)}", *c_args]
                 if not any(a.startswith("--color") for a in c_args):
                     c_args = ["--color=no", *c_args]
+                c_args.append(f"--junitxml={self._container_path(container_junit)}")
             c_pypath = [self._container_path(src_candidate)] if src_candidate.is_dir() else []
             c_pypath.append(self._container_path(code_root))
             (code_root / RECEIPT_FILENAME).unlink(missing_ok=True)
-            proc = self._run_in_container(
-                runtime=runtime,
-                rw_roots=(code_root,),
-                ro_roots=ro_evidence_roots,
-                cwd=code_root,
-                inner_argv=["python", "-m", tool_mod, *c_args],
-                timeout_s=timeout_s,
-                label=f"run_verification_cmd ({canonical_cmd})",
-                extra_env={"PYTHONPATH": ":".join(c_pypath)},
-            )
+            try:
+                proc = self._run_in_container(
+                    runtime=runtime,
+                    rw_roots=(code_root,),
+                    ro_roots=ro_evidence_roots,
+                    cwd=code_root,
+                    inner_argv=["python", "-m", tool_mod, *c_args],
+                    timeout_s=eff_timeout_s,
+                    label=f"run_verification_cmd ({canonical_cmd})",
+                    extra_env={"PYTHONPATH": ":".join(c_pypath)},
+                )
+                if tool_mod == "pytest" and container_junit.is_file():
+                    passed_tests = sorted(self._parse_junit_passed_tests(container_junit, code_root))
+            finally:
+                container_junit.unlink(missing_ok=True)
         else:
             self._assert_process_backend_allowed()
             import tempfile
 
             sbx_tmp = Path(tempfile.mkdtemp(prefix="m37_verify_tmp_")).resolve()
+            junit_file = sbx_tmp / "m37_junit.xml"
             allowed_write_roots = (code_root,)
             snapshot = self._capture_protected_snapshot(allowed_write_roots)
             timed_out_exc: subprocess.TimeoutExpired | None = None
@@ -1704,6 +1828,7 @@ class ExecutionGuard:
                         effective_tool_args = [f"--rootdir={code_root}", *effective_tool_args]
                     if not any(a.startswith("--color") for a in effective_tool_args):
                         effective_tool_args = ["--color=no", *effective_tool_args]
+                    effective_tool_args.append(f"--junitxml={junit_file}")
 
                 harness_code = self._build_audit_hook_harness(
                     mode="module",
@@ -1728,9 +1853,11 @@ class ExecutionGuard:
                         shell=False,
                         capture_output=True,
                         text=True,
-                        timeout=min(max(timeout_s, 1), 60),
+                        timeout=min(max(eff_timeout_s, 1), 600),
                         check=False,
                     )
+                    if tool_mod == "pytest" and junit_file.is_file():
+                        passed_tests = sorted(self._parse_junit_passed_tests(junit_file, code_root))
                 except subprocess.TimeoutExpired as exc:
                     timed_out_exc = exc
             finally:
@@ -1765,18 +1892,21 @@ class ExecutionGuard:
                 effective_exit = 5
 
         tree_sha256 = compute_code_tree_sha256(code_root)
-        receipt = {
+        receipt: dict[str, Any] = {
             "encargo": self.ctx.engagement_id,
             "nodo": self.ctx.node_id,
             "command": canonical_cmd,
             "tool": tool_mod,
             "backend": backend,
+            "full_suite": True,
             "exit_code": effective_exit,
             "tree_sha256": tree_sha256,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "stdout_tail": proc.stdout[-4000:],
             "stderr_tail": proc.stderr[-4000:],
         }
+        if passed_tests is not None:
+            receipt["passed_tests"] = passed_tests
         # Only actual test runners (pytest/unittest) can emit or update the TDD verification receipt
         if tool_mod in ("pytest", "unittest"):
             write_utf8_lf(
@@ -1817,9 +1947,10 @@ class ExecutionGuard:
         self,
         script_path: str | Path,
         args: list[str] | None = None,
-        timeout_s: int = 60,
+        timeout_s: int | None = None,
     ) -> dict[str, Any]:
         """Internal runner for analytical scripts in analisis/<encargo>/ with audit-hook + timeout-safe rollback."""
+        eff_timeout_s = self.ctx.default_timeout_s if timeout_s is None else timeout_s
         if not self.ctx.allow_compute:
             raise PermissionDeniedError(
                 f"El nodo {self.ctx.node_id!r} tiene requiere_computo=False; no se permite ejecutar scripts analíticos."
@@ -1860,7 +1991,7 @@ class ExecutionGuard:
                 ro_roots=ro_roots,
                 cwd=analisis_enc,
                 inner_argv=["python", self._container_path(resolved_script), *(args or [])],
-                timeout_s=timeout_s,
+                timeout_s=eff_timeout_s,
                 label=f"run_sandbox_script ({resolved_script.name})",
             )
         else:
@@ -1900,7 +2031,7 @@ class ExecutionGuard:
                         shell=False,
                         capture_output=True,
                         text=True,
-                        timeout=min(max(timeout_s, 1), 60),
+                        timeout=min(max(eff_timeout_s, 1), 600),
                         check=False,
                     )
                 except subprocess.TimeoutExpired as exc:
@@ -1935,7 +2066,7 @@ class ExecutionGuard:
         self,
         script_path: str | Path,
         args: list[str] | None = None,
-        timeout_s: int = 60,
+        timeout_s: int | None = None,
     ) -> dict[str, Any]:
         """Execute a script in analisis/<encargo>/ protected by process audit-hook guardrail + lossless snapshot check."""
         self._require_tool_permission("run_sandbox_script")
@@ -1973,24 +2104,8 @@ class ExecutionGuard:
         snapshot: dict[Path, _FileSnapshotEntry],
         allowed_write_roots: tuple[Path, ...],
     ) -> bool:
-        """Verify protected files were not modified or created; NEVER delete pre-existing files of any size."""
+        """Verify protected files were not modified or deleted; NEVER delete pre-existing or user-created files."""
         tampered = False
-        ws_root = self.paths.workspace_root.resolve()
-        for fpath in ws_root.rglob("*"):
-            if not fpath.is_file():
-                continue
-            res = fpath.resolve()
-            if any(res == r or r in res.parents for r in allowed_write_roots):
-                continue
-            if any(part in EXCLUDED_CODE_DIRS for part in res.parts):
-                continue
-            if res not in snapshot:
-                # Truly did not exist before execution -> remove unauthorized new file
-                tampered = True
-                try:
-                    res.unlink()
-                except OSError:
-                    pass
 
         for orig_path, entry in snapshot.items():
             if not orig_path.is_file():
@@ -2018,6 +2133,7 @@ class ExecutionGuard:
     def _enforce_web_fetch_policy(self, url: str) -> None:
         """A3: bound the exfiltration channel that an agent-chosen URL represents.
 
+        - Only http:// and https:// schemes are accepted.
         - No credentials embedded in the URL and a hard cap on URL / query-string size.
         - If the Brief declares `dominios_web_permitidos`, only those hosts (and their subdomains) are reachable.
         - In L3/L4 the allowlist is mandatory: without it web_fetch_clean is refused.
@@ -2025,6 +2141,10 @@ class ExecutionGuard:
         import urllib.parse
 
         parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise PermissionDeniedError(
+                f"Esquema URL prohibido en web_fetch_clean: solo se permite http/https (recibido: {parsed.scheme!r})."
+            )
         if parsed.username or parsed.password:
             raise PermissionDeniedError("web_fetch_clean no acepta credenciales embebidas en la URL.")
         if len(url) > 1024 or len(parsed.query) > 256:
@@ -2057,14 +2177,14 @@ class ExecutionGuard:
             pins[(urllib.parse.urlsplit(target_url).hostname or "").strip().lower()] = pinned_ip
 
         pins: dict[str, str] = {}
-        _pin(url)
         self._enforce_web_fetch_policy(url)
+        _pin(url)
         guard_self = self
 
         class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
-                _pin(newurl)
                 guard_self._enforce_web_fetch_policy(newurl)
+                _pin(newurl)
                 return super().redirect_request(req, fp, code, msg, headers, newurl)
 
         opener = build_pinned_opener(pins, _SafeRedirectHandler())
@@ -2072,8 +2192,39 @@ class ExecutionGuard:
             url,
             headers={"User-Agent": "M37-CleanFetch/0.2 (+https://move37.local)"},
         )
+        final_url = url
         with opener.open(req, timeout=timeout_s) as resp:
-            raw_html = resp.read(1_500_000).decode("utf-8", errors="replace")
+            if hasattr(resp, "geturl"):
+                final_url = str(resp.geturl() or final_url)
+            content_type = ""
+            charset = "utf-8"
+            headers_obj = getattr(resp, "headers", None)
+            if headers_obj is not None:
+                if hasattr(headers_obj, "get_content_type"):
+                    content_type = str(headers_obj.get_content_type() or "").lower()
+                else:
+                    content_type = str(headers_obj.get("Content-Type", "")).split(";")[0].strip().lower()
+                if hasattr(headers_obj, "get_content_charset"):
+                    charset = str(headers_obj.get_content_charset() or "utf-8")
+                else:
+                    raw_ct = str(headers_obj.get("Content-Type", ""))
+                    m_cs = re.search(r"charset=([A-Za-z0-9._-]+)", raw_ct, flags=re.IGNORECASE)
+                    if m_cs:
+                        charset = m_cs.group(1)
+
+            blocked_prefixes = ("image/", "audio/", "video/")
+            blocked_exact = {"application/pdf", "application/octet-stream", "application/zip"}
+            if content_type in blocked_exact or content_type.startswith(blocked_prefixes):
+                raise PermissionDeniedError(
+                    f"web_fetch_clean rechazó Content-Type no textual {content_type!r}. "
+                    "Registra archivos binarios mediante `m37 ingest`."
+                )
+
+            raw_bytes = resp.read(1_500_000)
+            try:
+                raw_html = raw_bytes.decode(charset, errors="replace")
+            except LookupError:
+                raw_html = raw_bytes.decode("utf-8", errors="replace")
 
         try:
             import trafilatura  # type: ignore[import-not-found]
@@ -2092,9 +2243,9 @@ class ExecutionGuard:
         snap_rel = f"referencias/{PUBLIC_SNAPSHOT_DIRNAME}/web_{snap_hash[:12]}.txt"
         snap_abs = (self.paths.workspace_root / snap_rel).resolve()
         write_utf8_lf(snap_abs, clean_slice + "\n")
-        registered = register_snapshot(self.paths, snap_abs, "kernel_fetch", url=url)
+        registered = register_snapshot(self.paths, snap_abs, "kernel_fetch", url=final_url)
 
         header_meta = (
             f"[SNAPSHOT_LOCAL: {snap_rel} | HASH_SNAPSHOT: sha256:{registered['sha256']} | ORIGEN: kernel_fetch]\n"
         )
-        return sanitize_untrusted_payload(header_meta + clean_slice, source_id=url)
+        return sanitize_untrusted_payload(header_meta + clean_slice, source_id=final_url)

@@ -27,6 +27,7 @@ from typing import Any
 
 from m37 import __version__, gates
 from m37.cli import (
+    _infer_required_artifact_kinds,
     compile_deliverable,
     create_new_engagement,
     generate_plan_from_archetype,
@@ -45,6 +46,7 @@ from m37.config import (
 from m37.guards import (
     AgentExecutionContext,
     ExecutionGuard,
+    PermissionDeniedError,
     allocate_next_id,
     resolve_artifact_by_id,
     write_utf8_lf,
@@ -52,6 +54,7 @@ from m37.guards import (
 from m37.runner import append_episodic_event
 from m37.schemas import (
     BriefContract,
+    ContractValidationError,
     FindingContract,
     NodeContract,
     compute_finding_substantive_sha256,
@@ -99,6 +102,22 @@ def _load_reindex_module() -> Any:
 def _ensure_index(paths: WorkspacePaths) -> tuple[Any, Path]:
     mod = _load_reindex_module()
     db_path = paths.duckdb_index_path()
+    idx_files = [p for p in (db_path, db_path.with_suffix(".json")) if p.is_file()]
+    if idx_files and paths.vault_root.is_dir():
+        idx_mtime = max(p.stat().st_mtime_ns for p in idx_files)
+        excluded = {".indice", ".obsidian", ".trash"}
+        latest_source_mtime = max(
+            (
+                p.stat().st_mtime_ns
+                for p in paths.vault_root.rglob("*")
+                if p.is_file()
+                and not any(part in excluded for part in p.parts)
+                and p.suffix.lower() in (".md", ".json", ".jsonl")
+            ),
+            default=0,
+        )
+        if latest_source_mtime <= idx_mtime:
+            return mod, db_path
     mod.reindex_vault_to_duckdb(paths)
     return mod, db_path
 
@@ -225,6 +244,7 @@ def m37_init_or_new_engagement(
 def m37_plan_engagement(
     id_encargo: str,
     arquetipo: str = "ARQ_Diagnostico-Cualitativo",
+    motivo_replanificacion: str | None = None,
     vault: str | None = None,
 ) -> dict[str, Any]:
     """Compila 01_Plan.md y Nodos/N-*.md desde un Arquetipo declarativo en modo harness. Requiere Puerta 1 sellada; la Puerta 2 la aprueba una persona con `m37 approve`."""
@@ -234,6 +254,7 @@ def m37_plan_engagement(
         id_encargo,
         archetype_name=arquetipo,
         harness_mode=True,
+        motivo_replanificacion=motivo_replanificacion,
     )
     nodos_summary: list[dict[str, Any]] = []
     for np in node_paths:
@@ -261,6 +282,144 @@ def m37_plan_engagement(
             f"Pide a la persona que revise 01_Plan.md y Nodos/ y ejecute en su terminal: m37 approve {id_encargo} --gate 2"
         ),
     }
+
+
+def _collect_mcp_route_owners(paths: WorkspacePaths, id_encargo: str) -> dict[str, set[str]]:
+    owners: dict[str, set[str]] = {}
+    ep_log = paths.episodios_path()
+    if not ep_log.is_file():
+        return owners
+    for line in ep_log.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("tipo_evento") != "harness_accion" or ev.get("encargo") != id_encargo:
+            continue
+        nodo = str(ev.get("nodo") or "").strip()
+        raw_rel = str(ev.get("resultado_ruta") or "").replace("\\", "/").lstrip("/")
+        if raw_rel.startswith("./"):
+            raw_rel = raw_rel[2:]
+        if nodo and raw_rel:
+            owners.setdefault(raw_rel, set()).add(nodo)
+    return owners
+
+
+def _path_matches_dep_owner(
+    paths: WorkspacePaths,
+    candidate: Path,
+    dep_id: str,
+    route_owners: dict[str, set[str]],
+) -> bool:
+    rel = candidate.resolve().relative_to(paths.workspace_root.resolve()).as_posix()
+    return dep_id in route_owners.get(rel, set()) or rel not in route_owners
+
+
+def _dep_has_kind_artifact(
+    paths: WorkspacePaths,
+    enc_dir: Path,
+    id_encargo: str,
+    dep_id: str,
+    kind: str,
+    route_owners: dict[str, set[str]],
+) -> bool:
+    if kind == "evidencia":
+        ei_dir = enc_dir / "Evidencia_Interna"
+        if ei_dir.is_dir():
+            for ep in ei_dir.glob("EI-*.md"):
+                if ep.is_file() and _path_matches_dep_owner(paths, ep, dep_id, route_owners):
+                    return True
+        pub_dir = paths.vault_root / "30_Evidencia_Publica"
+        if pub_dir.is_dir():
+            for ep in pub_dir.glob("E-*.md"):
+                if not ep.is_file():
+                    continue
+                rel = ep.resolve().relative_to(paths.workspace_root.resolve()).as_posix()
+                if dep_id in route_owners.get(rel, set()):
+                    return True
+                try:
+                    em, _ = parse_raw_artifact(ep.read_text(encoding="utf-8"), suffix=".md")
+                    if str(em.get("encargo_origen") or "").strip() == id_encargo and rel not in route_owners:
+                        return True
+                except ContractValidationError:
+                    continue
+        return False
+    if kind == "derivacion":
+        der_dir = enc_dir / "Derivaciones"
+        if der_dir.is_dir():
+            for dp in der_dir.glob("D-*"):
+                if (
+                    dp.suffix.lower() in (".json", ".md")
+                    and dp.is_file()
+                    and _path_matches_dep_owner(paths, dp, dep_id, route_owners)
+                ):
+                    return True
+        return False
+    if kind == "hallazgo":
+        hal_dir = enc_dir / "Hallazgos"
+        if hal_dir.is_dir():
+            for hp in hal_dir.glob("H-*.md"):
+                if hp.is_file() and _path_matches_dep_owner(paths, hp, dep_id, route_owners):
+                    return True
+        return False
+    if kind == "codigo":
+        cdir = paths.codigo_root / id_encargo
+        return cdir.is_dir() and any(
+            f.is_file()
+            and not f.name.startswith(".")
+            and "__pycache__" not in f.parts
+            and _path_matches_dep_owner(paths, f, dep_id, route_owners)
+            for f in cdir.rglob("*")
+        )
+    if kind == "entregable":
+        edir = enc_dir / "Entregables"
+        return edir.is_dir() and any(
+            ep.is_file() and _path_matches_dep_owner(paths, ep, dep_id, route_owners)
+            for ep in edir.glob("*.md")
+        )
+    return True
+
+
+def _assert_mcp_node_dependencies_satisfied(
+    paths: WorkspacePaths,
+    enc_dir: Path,
+    id_encargo: str,
+    node_obj: NodeContract,
+) -> None:
+    if not node_obj.depende_de:
+        return
+    route_owners = _collect_mcp_route_owners(paths, id_encargo)
+    for dep_raw in node_obj.depende_de:
+        dep_id = extract_wikilink_id(str(dep_raw))
+        dep_file = enc_dir / "Nodos" / f"{dep_id}.md"
+        if not dep_file.is_file():
+            raise PermissionDeniedError(
+                f"No se puede escribir en {node_obj.id}: el nodo dependencia {dep_id!r} ({dep_file.name}) no existe."
+            )
+        dep_obj, _, _ = validate_artifact_content(
+            dep_file.read_text(encoding="utf-8"),
+            suffix=".md",
+            expected_tipo="nodo",
+        )
+        assert isinstance(dep_obj, NodeContract)
+        if dep_obj.estado in ("rechazado_r1", "escalado_humano", "bloqueado_presupuesto"):
+            raise PermissionDeniedError(
+                f"No se puede escribir en {node_obj.id}: dependencia {dep_id} en estado {dep_obj.estado!r}."
+            )
+        if dep_obj.estado in ("aceptado", "completado"):
+            continue
+        missing = [
+            kind
+            for kind in _infer_required_artifact_kinds(dep_obj)
+            if not _dep_has_kind_artifact(paths, enc_dir, id_encargo, dep_id, kind, route_owners)
+        ]
+        if missing:
+            raise PermissionDeniedError(
+                f"No se puede escribir en {node_obj.id}: la dependencia {dep_id} aún no ha producido los artefactos "
+                f"requeridos ({missing})."
+            )
 
 
 def m37_write_artifact(
@@ -292,6 +451,7 @@ def m37_write_artifact(
         expected_tipo="nodo",
     )
     assert isinstance(node_obj, NodeContract)
+    _assert_mcp_node_dependencies_satisfied(paths, enc_dir, id_encargo, node_obj)
 
     act = action.strip().lower()
     guard = ExecutionGuard(
@@ -308,6 +468,7 @@ def m37_write_artifact(
             base_env=env,
             web_allowed_domains=tuple(brief_obj.dominios_web_permitidos),
             web_requires_allowlist=brief_obj.nivel_rigor in ("L3", "L4"),
+            default_timeout_s=node_obj.timeout_segundos,
         ),
     )
 
@@ -690,6 +851,7 @@ MCP_TOOL_CATALOG: list[dict[str, Any]] = [
             "properties": {
                 "id_encargo": {"type": "string"},
                 "arquetipo": {"type": "string", "default": "ARQ_Diagnostico-Cualitativo"},
+                "motivo_replanificacion": {"type": "string"},
                 "vault": {"type": "string"},
             },
             "required": ["id_encargo"],
